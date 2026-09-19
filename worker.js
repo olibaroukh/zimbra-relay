@@ -1284,18 +1284,29 @@ return weights;
 function healthSubScoresServer(s) {
 const scores = {};
 
+// Bascule du 19/09 (initialement prévue pour janvier 2027, avancée à la
+// demande d'Olivier) : "pas de donnée" ne veut plus dire "exclu du calcul"
+// pour la plupart des dimensions — un outil jamais utilisé doit peser sur le
+// score, pas être ignoré. Exception maintenue pour 3 dimensions qui dépendent
+// d'un import/flux RÉSEAU plutôt que d'un usage du magasin lui-même
+// (effectif, absenteisme : import RH mensuel ; avis : rafraîchissement
+// Google automatique) — un retard d'import ou un glitch d'API ne doit pas
+// faire chuter tout le réseau d'un coup sur ces 3-là ; elles restent
+// exclues (null) si la donnée manque, comme avant.
 if (s.actionsNonSoldees && Array.isArray(s.actionsNonSoldees.items)) {
 const penalty = s.actionsNonSoldees.items
 .filter(a => a.fromPrevious)
 .reduce((acc, a) => acc + (a.status === 'todo' ? 25 : 15), 0);
 scores.actions = Math.max(0, 100 - penalty);
 } else {
-scores.actions = null;
+scores.actions = 0;
 }
 
 // Sous-effectif soutenu (RH, 3 mois consécutifs) combiné au sur-effectif
 // déclaratif existant : on garde le pire des deux signaux. Le sur-effectif
 // n'est pas affecté (le signal RH ne peut jamais faire remonter le score).
+// Reste exclu (null) si pas de donnée — dépend de l'import RH réseau, pas
+// d'un usage du magasin (voir commentaire en tête de fonction).
 if (s.effectif && s.effectif.delta !== null && s.effectif.delta !== undefined) {
 let score = s.effectif.delta <= 0 ? 100 : Math.max(0, 100 - s.effectif.delta * 25);
 if (s.effectifRH && s.effectifRH.soutenu && s.effectifRH.ecartMoyen !== null) {
@@ -1310,6 +1321,7 @@ scores.effectif = null;
 
 // Absentéisme (RH, groupe A / jours ouvrés théoriques, longue durée incluse) —
 // moyenne des notes mensuelles sur tous les mois disponibles pour ce magasin.
+// Reste exclu (null) si pas de donnée — import RH réseau (voir ci-dessus).
 if (s.absenteisme && s.absenteisme.score !== null && s.absenteisme.score !== undefined) {
 scores.absenteisme = s.absenteisme.score;
 } else {
@@ -1319,15 +1331,18 @@ scores.absenteisme = null;
 if (s.positionnementAnnuel !== null && s.positionnementAnnuel !== undefined) {
 scores.positionnement = Math.max(0, Math.min(100, s.positionnementAnnuel));
 } else {
-scores.positionnement = null;
+scores.positionnement = 0;
 }
 
 if (s.pedlv && s.pedlv.total) {
 scores.pedlv = Math.max(0, 100 - (s.pedlv.rouge / s.pedlv.total) * 100);
 } else {
-scores.pedlv = null;
+scores.pedlv = 0;
 }
 
+// Avis Google : reste exclu (null) si pas de donnée — dépend du
+// rafraîchissement automatique réseau, pas d'un usage du magasin (voir
+// commentaire en tête de fonction).
 if (s.googleRating && s.googleRating.rating) {
 scores.avis = Math.max(0, Math.min(100, (Number(s.googleRating.rating) / 5) * 100));
 } else {
@@ -1337,21 +1352,22 @@ scores.avis = null;
 if (s.niveauEquipe !== null && s.niveauEquipe !== undefined) {
 scores.equipe = Math.max(0, Math.min(100, (Number(s.niveauEquipe) / 10) * 100));
 } else {
-scores.equipe = null;
+scores.equipe = 0;
 }
 
 // Kaizen : score du DERNIER mois clôturé (pas le mois en cours, qui peut être
 // partiellement rempli et fausserait le score à la baisse en cours de mois).
-// null tant qu'aucun mois n'a encore été clôturé pour ce magasin.
+// 0 tant qu'aucun mois n'a encore été clôturé pour ce magasin.
 if (s.kaizenDernierScoreCloture !== null && s.kaizenDernierScoreCloture !== undefined && s.kaizenDernierScoreMax) {
 scores.kaizen = Math.max(0, Math.min(100, (s.kaizenDernierScoreCloture / s.kaizenDernierScoreMax) * 100));
 } else {
-scores.kaizen = null;
+scores.kaizen = 0;
 }
 
-// Entretiens individuels et lancements de journée (phase 3, 18/09) — JAMAIS
-// null, contrairement à toutes les dimensions ci-dessus : 0 par défaut si
-// s.entretiensLancements est absent (voir commentaire sur getEntretiensLancementsMap).
+// Entretiens individuels et lancements de journée (phase 3, 18/09) — 0 par
+// défaut si s.entretiensLancements est absent (voir commentaire sur
+// getEntretiensLancementsMap). Même règle que actions/positionnement/pedlv/
+// equipe/kaizen ci-dessus depuis le 19/09.
 scores.entretiens = s.entretiensLancements ? s.entretiensLancements.tauxEntretiens : 0;
 scores.lancements = s.entretiensLancements ? s.entretiensLancements.tauxLancements : 0;
 
