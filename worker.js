@@ -1251,16 +1251,35 @@ s.lastDate ? `${s.daysSince}j` : '—',
 // ── Digest hebdo : score de santé (dérive / accumulation de signaux) ──────
 // Vient compléter (pas remplacer) la relance visite. Ne reprend jamais un
 // magasin déjà signalé en retard de visite : ce signal reste prioritaire et
-// géré par sa propre section. Duplique volontairement POIDS_SANTE /
-// healthSubScores / computeHealthScore de index.html, car un cron ne peut
-// pas exécuter le JS de l'app. ATTENTION : si les coefficients sont réglés
-// via la modale ⚖️ de l'app et repoussés sur GitHub, il faut répercuter
-// manuellement les mêmes valeurs ici, sinon le digest et l'onglet Tournée
-// finiront par diverger.
-const POIDS_SANTE_SERVER = {
+// géré par sa propre section. La FORMULE (healthSubScores / computeHealthScore)
+// reste dupliquée avec index.html par nécessité : un cron ne peut pas exécuter
+// le JS de l'app. Les POIDS eux-mêmes, en revanche, ne sont plus dupliqués :
+// source unique = table D1 health_weights, lue par getHealthWeights() et
+// éditable en direct depuis la modale ⚖️ de l'app (route POST /health-weights,
+// réservée à Olivier). POIDS_SANTE_DEFAULT ne sert plus que de valeur de
+// repli si la table est vide/inaccessible.
+const POIDS_SANTE_DEFAULT = {
 actions: 7, effectif: 3, absenteisme: 4, positionnement: 5, pedlv: 8, avis: 4, equipe: 6, kaizen: 7,
 entretiens: 6, lancements: 5,
 };
+
+// Lit les poids courants depuis D1 (source unique, éditable via la modale ⚖️
+// de bilan-passage/index.html). Retombe sur POIDS_SANTE_DEFAULT clé par clé
+// si la table est vide, absente, ou en cas d'erreur — ne bloque jamais le
+// calcul du score.
+async function getHealthWeights(env) {
+const weights = { ...POIDS_SANTE_DEFAULT };
+if (!env.DB) return weights;
+try {
+const { results } = await env.DB.prepare('SELECT key, value FROM health_weights').all();
+for (const r of results) {
+if (r.key in weights) weights[r.key] = r.value;
+}
+} catch (e) {
+console.error('Erreur lecture health_weights, poids par défaut utilisés :', e);
+}
+return weights;
+}
 
 function healthSubScoresServer(s) {
 const scores = {};
@@ -1339,14 +1358,15 @@ scores.lancements = s.entretiensLancements ? s.entretiensLancements.tauxLancemen
 return scores;
 }
 
-function computeHealthScoreServer(s, precomputedSub) {
+function computeHealthScoreServer(s, precomputedSub, weights) {
 const sub = precomputedSub || healthSubScoresServer(s);
+const poids = weights || POIDS_SANTE_DEFAULT;
 let total = 0, possible = 0, totalWeight = 0;
-Object.keys(POIDS_SANTE_SERVER).forEach(key => {
-totalWeight += POIDS_SANTE_SERVER[key];
+Object.keys(poids).forEach(key => {
+totalWeight += poids[key];
 if (sub[key] === null) return;
-total += sub[key] * POIDS_SANTE_SERVER[key];
-possible += POIDS_SANTE_SERVER[key];
+total += sub[key] * poids[key];
+possible += poids[key];
 });
 if (possible < totalWeight * 0.5) return null;
 return Math.round(total / possible);
@@ -1651,6 +1671,7 @@ return map;
 // (scope = tous les magasins, sans notion de session).
 async function buildStoreHealthResults(env, scope) {
 const todayISO = new Date().toISOString().slice(0, 10);
+const healthWeights = await getHealthWeights(env);
 const snapshots = await getLastBilanSnapshots(env);
 const lastObservationMap = await getLastObservationMap(env);
 let ratingsMap = {};
@@ -1715,7 +1736,7 @@ entretiensLancements: entretiensLancementsMap[store.code] || { tauxEntretiens: 0
 // pour que dashboard.html n'ait pas à dupliquer POIDS_SANTE une 3e fois
 // (déjà dupliqué worker.js / bilan-passage/index.html).
 result.subScores = healthSubScoresServer(result);
-result.score = computeHealthScoreServer(result, result.subScores);
+result.score = computeHealthScoreServer(result, result.subScores, healthWeights);
 return result;
 }).sort((a, b) => (b.daysSinceVisit ?? 9999) - (a.daysSinceVisit ?? 9999));
 }
@@ -2938,7 +2959,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -4660,6 +4681,49 @@ ratings[r.magasin_code] = { rating: r.rating, reviewsCount: r.reviews_count, upd
 return new Response(JSON.stringify({ ok: true, ratings }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture google_ratings : ' + String(e), 500, corsHeaders);
+}
+}
+
+// Poids du score de santé (source unique — voir getHealthWeights). GET public
+// en lecture (déjà visible côté client de toute façon), POST réservé à
+// Olivier via la modale ⚖️ de bilan-passage/index.html.
+if (url.pathname === '/health-weights' && request.method === 'GET') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+const weights = await getHealthWeights(env);
+return new Response(JSON.stringify({ ok: true, weights }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur lecture health_weights : ' + String(e), 500, corsHeaders);
+}
+}
+
+if (url.pathname === '/health-weights' && request.method === 'POST') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (sessionAr !== 'ALL') return jsonError('Réservé à Olivier', 403, corsHeaders);
+try {
+const body = await request.json();
+const now = new Date().toISOString();
+const stmts = [];
+for (const key of Object.keys(POIDS_SANTE_DEFAULT)) {
+if (!(key in body)) continue;
+const value = parseInt(body[key], 10);
+if (!Number.isFinite(value) || value < 0 || value > 10) return jsonError(`Poids invalide pour "${key}" (attendu 0-10)`, 400, corsHeaders);
+stmts.push(env.DB.prepare(
+`INSERT INTO health_weights (key, value, updated_at) VALUES (?, ?, ?)
+ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+).bind(key, value, now));
+}
+if (!stmts.length) return jsonError('Aucun poids reconnu dans la requête', 400, corsHeaders);
+await env.DB.batch(stmts);
+const weights = await getHealthWeights(env);
+return new Response(JSON.stringify({ ok: true, weights }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur écriture health_weights : ' + String(e), 500, corsHeaders);
 }
 }
 
