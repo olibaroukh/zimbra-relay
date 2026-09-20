@@ -2975,7 +2975,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -5430,6 +5430,72 @@ headers: {
 ...corsHeaders,
 },
 });
+}
+
+// ============================================================
+// NUTRITION LOG — Routes Jarvis (ajouté 2026-09-20)
+// ============================================================
+
+// Routes nutrition — CORS ouvert (*) car appelées depuis la PWA iPhone (origin variable)
+const nutCors = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Store-Token',
+};
+
+if (url.pathname.startsWith('/nutrition-log') && request.method === 'OPTIONS') {
+  return new Response(null, { status: 204, headers: nutCors });
+}
+
+if (url.pathname === '/nutrition-log' && request.method === 'POST') {
+  const _nt1 = request.headers.get('X-Store-Token') || '';
+  if (_nt1 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  let body;
+  try { body = await request.json(); } catch { return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } }); }
+  const { type, name, date, checked } = body;
+  if (!type || !name || !date) return new Response(JSON.stringify({ error: 'Champs manquants' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  if (!['meal', 'supplement'].includes(type)) return new Response(JSON.stringify({ error: 'type invalide' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return new Response(JSON.stringify({ error: 'Format date invalide' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  const userToken = _nt1.substring(0, 8);
+  try {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM nutrition_log WHERE type = ? AND name = ? AND date = ? AND user_token = ?').bind(type, String(name), date, userToken),
+      env.DB.prepare("INSERT INTO nutrition_log (type, name, date, checked, user_token, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))").bind(type, String(name), date, checked ? 1 : 0, userToken),
+    ]);
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: 'D1 error: ' + err.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  }
+}
+
+if (url.pathname === '/nutrition-log/ping') {
+  const _nt2 = request.headers.get('X-Store-Token') || '';
+  if (_nt2 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  try {
+    const result = await env.DB.prepare('SELECT COUNT(*) as cnt FROM nutrition_log').first();
+    return new Response(JSON.stringify({ ok: true, rows: result.cnt }), { status: 200, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: 'D1 error: ' + err.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  }
+}
+
+if (url.pathname === '/nutrition-log/summary') {
+  const _nt3 = request.headers.get('X-Store-Token') || '';
+  if (_nt3 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  const date = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return new Response(JSON.stringify({ error: 'Format date invalide' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  try {
+    const { results } = await env.DB.prepare('SELECT type, name, checked, created_at FROM nutrition_log WHERE date = ? ORDER BY type, created_at').bind(date).all();
+    const meals = results.filter(r => r.type === 'meal');
+    const supplements = results.filter(r => r.type === 'supplement');
+    return new Response(JSON.stringify({
+      date,
+      meals: { total: meals.length, checked: meals.filter(r => r.checked).length, items: meals },
+      supplements: { total: supplements.length, checked: supplements.filter(r => r.checked).length, items: supplements },
+    }), { status: 200, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: 'D1 error: ' + err.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  }
 }
 
 // par défaut : relais SOAP (AuthRequest, SendMsgRequest, ...)
