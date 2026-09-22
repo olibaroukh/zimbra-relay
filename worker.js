@@ -3291,6 +3291,39 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
 }
 
+// ============================================================================
+// Route dédiée pour que le Worker Jarvis (séparé, jarvis.oli-baroukh.workers.dev)
+// puisse envoyer des mails via le compte Zimbra d'automatisation déjà utilisé
+// ici (zimbraSendMail), sans dupliquer les identifiants Zimbra sur ce second
+// Worker. Protégée par un secret DÉDIÉ (JARVIS_MAIL_SECRET), distinct de
+// STORE_SECRET, pour ne pas mélanger les portées d'autorisation. Ajouté le
+// 22/09/2026 dans le cadre du projet Jarvis — n'affecte aucune route existante.
+// ============================================================================
+if (url.pathname === '/jarvis-mail' && request.method === 'POST') {
+const jarvisToken = request.headers.get('X-Jarvis-Mail-Token');
+if (!env.JARVIS_MAIL_SECRET || jarvisToken !== env.JARVIS_MAIL_SECRET) {
+return new Response('Non autorisé', { status: 401, headers: corsHeaders });
+}
+const data = await request.json();
+if (!data?.to || !data?.subject || !(data?.bodyHtml || data?.bodyText)) {
+return new Response('Champs requis manquants (to, subject, bodyHtml ou bodyText)', { status: 400, headers: corsHeaders });
+}
+try {
+await zimbraSendMail(env, {
+to: data.to,
+subject: data.subject,
+bodyText: data.bodyText,
+bodyHtml: data.bodyHtml,
+});
+return new Response(JSON.stringify({ ok: true }), {
+status: 200,
+headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+} catch (e) {
+return new Response('Erreur envoi mail : ' + String(e), { status: 500, headers: corsHeaders });
+}
+}
+
 if (url.pathname === '/last-actions') {
 const storeToken = request.headers.get('X-Store-Token');
 if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
