@@ -1092,6 +1092,89 @@ d.setUTCDate(d.getUTCDate() - 7);
 return d.toISOString().slice(0, 10);
 }
 
+// --- Objectifs réseau PEDLV (24/09) ---
+// Pour l'équité entre magasins, le statut vert/orange/rouge de chaque
+// indicateur PEDLV est recalculé ICI avec une grille unique (celle d'Olivier),
+// et non plus repris de ce qu'envoie le navigateur qui a fait l'import :
+// les objectifs réglés dans les Paramètres de PEDLV (localStorage) restent
+// valables pour l'affichage dans PEDLV, mais ne pèsent plus sur le score
+// santé, la fiche magasin, les rouges qui traînent ni les digests.
+// Même barème que PEDLV : vert >= 100 % obj., orange 70-99 %, rouge < 70 %.
+//
+// La grille se modifie SANS redéployer : fichier objectifs-reseau.json du
+// dépôt pour-etre-dans-le-vert (même fichier que celui qui sert de valeurs
+// par défaut dans PEDLV). Relu toutes les 5 min au plus. Les valeurs
+// ci-dessous ne servent que de secours si le fichier est illisible, ou pour
+// une clé absente / invalide dans le fichier.
+const OBJECTIFS_RESEAU_URL = 'https://raw.githubusercontent.com/olibaroukh/pour-etre-dans-le-vert/main/objectifs-reseau.json';
+const OBJECTIFS_RESEAU_PEDLV_SECOURS = {
+pm: 450,    // Panier moyen optique (€)
+tc: 95,     // Taux TC (%)
+sop: 40,    // Taux SOP (%)
+mdc: 66,    // Taux MDC (%)
+pack: 50,   // Taux pack confort (%)
+pmpc: 80,   // PM pack confort (€)
+ta: 30,     // Taux test auditif (%)
+tva: 12,    // Taux vente additionnelle audio (%)
+};
+let OBJECTIFS_RESEAU_PEDLV = { ...OBJECTIFS_RESEAU_PEDLV_SECOURS };
+let _objectifsReseauAt = 0;
+
+async function chargerObjectifsReseauPedlv() {
+const now = Date.now();
+if (_objectifsReseauAt && (now - _objectifsReseauAt) < 5 * 60 * 1000) return;
+_objectifsReseauAt = now;
+try {
+const resp = await fetch(OBJECTIFS_RESEAU_URL + '?v=' + now);
+if (!resp.ok) throw new Error('HTTP ' + resp.status);
+const data = await resp.json();
+const grille = { ...OBJECTIFS_RESEAU_PEDLV_SECOURS };
+for (const key of Object.keys(grille)) {
+const v = Number(data && data[key]);
+if (isFinite(v) && v > 0) grille[key] = v;
+}
+OBJECTIFS_RESEAU_PEDLV = grille;
+} catch (e) {
+console.error('objectifs-reseau.json illisible, grille conservée :', e);
+}
+}
+
+function statutPedlvReseau(valeur, objectif) {
+if (objectif === undefined || objectif === null || !objectif) return null;
+if (valeur === undefined || valeur === null || valeur === '') return null;
+const v = Number(valeur);
+if (isNaN(v)) return null;
+const ratio = v / objectif;
+if (ratio >= 1) return 'vert';
+if (ratio >= 0.7) return 'orange';
+return 'rouge';
+}
+
+// Idempotent : peut être appliqué à l'écriture et à la lecture (les lignes
+// importées avant ce correctif sont ainsi elles aussi réévaluées). L'objectif
+// du navigateur est conservé à titre d'info dans objectifMagasin.
+function normaliserIndicateursPedlv(indicateurs) {
+if (!indicateurs || typeof indicateurs !== 'object') return {};
+const out = {};
+for (const [key, v] of Object.entries(indicateurs)) {
+if (!v || typeof v !== 'object' || !(key in OBJECTIFS_RESEAU_PEDLV)) { out[key] = v; continue; }
+const objectifReseau = OBJECTIFS_RESEAU_PEDLV[key];
+out[key] = {
+...v,
+objectifMagasin: v.objectifMagasin !== undefined ? v.objectifMagasin : (v.objectif ?? null),
+objectif: objectifReseau,
+statut: statutPedlvReseau(v.valeur, objectifReseau),
+};
+}
+return out;
+}
+
+function parseIndicateursPedlv(json) {
+let indicateurs = {};
+try { indicateurs = JSON.parse(json || '{}'); } catch(e) {}
+return normaliserIndicateursPedlv(indicateurs);
+}
+
 function summarizePedlvIndicateurs(indicateurs) {
 const entries = Object.entries(indicateurs || {}).filter(([, v]) => v && v.statut);
 if (!entries.length) return { rouge: null, total: null };
@@ -1137,8 +1220,7 @@ const { results } = await env.DB.prepare(
 ).bind(...periodListe).all();
 const history = {};
 results.forEach(r => {
-let indicateurs = {};
-try { indicateurs = JSON.parse(r.indicateurs_json || '{}'); } catch(e) {}
+const indicateurs = parseIndicateursPedlv(r.indicateurs_json);
 (history[r.magasin_key] ??= {})[r.period_key] = indicateurs;
 });
 return { history, periodListe };
@@ -1180,8 +1262,7 @@ const out = [];
 stores.forEach(s => {
 const stat = storeStatsMap[normalizeName(s.libelle || '')];
 if (!stat) return;
-let indicateursThisWeek = {};
-try { indicateursThisWeek = JSON.parse(stat.indicateurs_json || '{}'); } catch(e) {}
+const indicateursThisWeek = parseIndicateursPedlv(stat.indicateurs_json);
 const magasinKey = normalizeName(s.libelle || '');
 const stuck = computeStuckPedlvIndicateurs(indicateursThisWeek, history, periodListe, magasinKey);
 stuck.forEach(it => out.push({ libelle: s.libelle, animateur: s.animateur, indicateur: it.indicateur, semainesConsecutives: it.semainesConsecutives }));
@@ -1851,8 +1932,7 @@ return { label: 'pas de données', delta: null };
 
 function computePedlvSummary(row) {
 if (!row) return null;
-let indicateurs = {};
-try { indicateurs = JSON.parse(row.indicateurs_json || '{}'); } catch(e) {}
+const indicateurs = parseIndicateursPedlv(row.indicateurs_json);
 const entries = Object.entries(indicateurs).filter(([, v]) => v && v.statut);
 if (!entries.length) return null;
 const rouge = entries.filter(([, v]) => v.statut === 'rouge').length;
@@ -3038,6 +3118,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 
 export default {
 async fetch(request, env) {
+await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
@@ -4283,6 +4364,8 @@ if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 try {
 const s = await request.json();
 if (!s.magasin) return jsonError('Champ magasin requis', 400, corsHeaders);
+// Statuts PEDLV recalculés avec la grille réseau (voir OBJECTIFS_RESEAU_PEDLV).
+s.indicateurs = normaliserIndicateursPedlv(s.indicateurs || {});
 await env.DB.prepare(
 `INSERT INTO store_stats (magasin, code_magasin, periode, date_extraction, ca_total, ca_opt, ca_audio, panier_moyen, taux_tc, taux_sop, taux_mdc, protheses_vendues, taux_essai, objectif, raf, prios_json, taux_test_auditif, taux_vente_add_audio, taux_pack_confort, pm_pack_confort, indicateurs_json, nb_vente_opt, jours_ouvres_mois, positionnement)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -5876,6 +5959,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 },
 
 async scheduled(event, env, ctx) {
+await chargerObjectifsReseauPedlv();
 const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
 ctx.waitUntil(withCronAlert(env, 'Com hebdo', () => sendComHebdo(env)));
