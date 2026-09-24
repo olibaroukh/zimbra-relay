@@ -2943,6 +2943,82 @@ await env.DB.prepare(
 // jusqu'à ce que quelqu'un remarque l'absence d'un rapport). N'avale jamais
 // l'erreur d'origine sans la logger, et si même l'envoi de l'alerte échoue
 // (Zimbra down par exemple), on le logge aussi plutôt que de perdre l'info.
+
+// ============================================================================
+// Accompagnement Manager — relances à 90 jours (24/09/2026)
+// ============================================================================
+const ACCOMP_RELANCE_JOURS = 90;
+const ACCOMP_APP_URL = 'https://olibaroukh.github.io/accompagnement-manager/';
+
+function accompItinerantEmail(row) {
+if (row.itinerant_email) return row.itinerant_email;
+// Comptes-rendus finalisés avant le 24/09 : pas d'email stocké, déduit du nom
+// ("Emilie Nahon" -> emilie.nahon@optical-center.com).
+const slug = String(row.itinerant || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim().replace(/\s+/g, '.');
+return slug ? slug + '@optical-center.com' : null;
+}
+
+function accompDateFr(iso) {
+const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+return m ? `${m[3]}/${m[2]}/${m[1]}` : (iso || '');
+}
+
+function accompEscape(s) {
+return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+async function runAccompagnementRelances(env, { dry }) {
+const seuil = new Date(Date.now() - ACCOMP_RELANCE_JOURS * 86400000).toISOString().slice(0, 10);
+const { results } = await env.DB.prepare(
+`SELECT id, magasin_code, magasin_libelle, manager, itinerant, itinerant_email, date_visite, contenu_json
+FROM accompagnements
+WHERE statut = 'finalise' AND COALESCE(relance_desactivee, 0) = 0 AND relance_itinerant_at IS NULL AND date_visite <= ?
+ORDER BY date_visite`
+).bind(seuil).all();
+
+const envoyes = [], annules = [], erreurs = [];
+for (const row of (results || [])) {
+// Annulée si une visite plus récente a été finalisée pour le même magasin
+const plusRecent = await env.DB.prepare(
+`SELECT id, date_visite FROM accompagnements WHERE magasin_code = ? AND statut = 'finalise' AND date_visite > ? AND id != ? LIMIT 1`
+).bind(row.magasin_code, row.date_visite, row.id).first();
+if (plusRecent) {
+annules.push({ id: row.id, magasin: row.magasin_libelle, date_visite: row.date_visite, remplace_par: plusRecent.date_visite });
+if (!dry) await env.DB.prepare('UPDATE accompagnements SET relance_desactivee = 2 WHERE id = ?').bind(row.id).run();
+continue;
+}
+const to = accompItinerantEmail(row);
+let contenu = {};
+try { contenu = JSON.parse(row.contenu_json || '{}'); } catch (e) {}
+const actions = ((contenu.plan && contenu.plan.actions) || []).filter(a => a && a.action);
+const lien = ACCOMP_APP_URL + '?relance=' + row.id;
+const subject = `Relance à 90 jours — ${row.magasin_libelle} (visite du ${accompDateFr(row.date_visite)})`;
+// Texte provisoire — en attente du texte définitif d'Olivier
+const bodyHtml = wrapEmailBody(`
+<p>Bonjour,</p>
+<p>Il y a ${ACCOMP_RELANCE_JOURS} jours, le <strong>${accompDateFr(row.date_visite)}</strong>, vous accompagniez <strong>${accompEscape(row.manager || 'le manager')}</strong> au magasin <strong>${accompEscape(row.magasin_libelle)}</strong>.</p>
+<p>Pensez à contacter le magasin pour faire le point sur le plan d'action décidé ce jour-là :</p>
+${actions.length ? '<ul>' + actions.map(a => `<li>${accompEscape(a.action)}${a.responsable ? ' — ' + accompEscape(a.responsable) : ''}${a.echeance ? ' (échéance ' + accompDateFr(a.echeance) + ')' : ''}</li>`).join('') + '</ul>' : '<p><em>Aucune action au plan.</em></p>'}
+<p style="margin:22px 0"><a href="${lien}" style="background:#E2231A;color:#fff;text-decoration:none;font-weight:bold;padding:11px 18px;border-radius:6px">Préparer la relance au magasin</a></p>
+<p style="color:#767676;font-size:12px">Le lien ouvre le compte-rendu dans Accompagnement Manager : la relance au magasin part ensuite de votre propre boîte mail.</p>`);
+if (!to) { erreurs.push({ id: row.id, magasin: row.magasin_libelle, erreur: 'email itinérant introuvable' }); continue; }
+if (dry) { envoyes.push({ id: row.id, magasin: row.magasin_libelle, date_visite: row.date_visite, to, subject, nbActions: actions.length }); continue; }
+try {
+await zimbraSendMail(env, { to, subject, bodyHtml });
+await env.DB.prepare(`UPDATE accompagnements SET relance_itinerant_at = datetime('now') WHERE id = ?`).bind(row.id).run();
+envoyes.push({ id: row.id, magasin: row.magasin_libelle, date_visite: row.date_visite, to });
+} catch (e) {
+erreurs.push({ id: row.id, magasin: row.magasin_libelle, erreur: String(e) });
+}
+}
+if (erreurs.length && !dry) {
+try {
+await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject: `⚠️ Relances Accompagnement Manager — ${erreurs.length} échec(s)`, bodyText: JSON.stringify(erreurs, null, 2) });
+} catch (e) { console.error(e); }
+}
+return { seuil, envoyes, annules, erreurs };
+}
+
 async function withCronAlert(env, jobName, fn) {
 try {
 await fn();
@@ -2975,7 +3051,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -3212,8 +3288,10 @@ const { session, error } = await requireAccompSession(request, corsHeaders);
 if (error) return error;
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 const { results } = await env.DB.prepare(
-'SELECT id, magasin_libelle, manager, date_visite, statut FROM accompagnements WHERE itinerant = ? ORDER BY updated_at DESC LIMIT 100'
-).bind(session.nom).all();
+// 23/09 : tous les utilisateurs voient tous les comptes-rendus (plus de filtre
+// par itinérant) — le front filtre par magasin.
+'SELECT id, magasin_code, magasin_libelle, manager, itinerant, date_visite, statut, updated_at, relance_desactivee, relance_itinerant_at, relance_magasin_at FROM accompagnements ORDER BY date_visite DESC, updated_at DESC LIMIT 500'
+).all();
 return new Response(JSON.stringify({ ok: true, items: results || [] }), {
 status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
@@ -3237,8 +3315,8 @@ status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
 // puis /soap avec attach.aid) — cette route ne fait plus que verrouiller
 // l'enregistrement une fois l'envoi confirmé par le client.
 await env.DB.prepare(
-`UPDATE accompagnements SET statut='finalise', finalized_at=datetime('now'), updated_at=datetime('now') WHERE id=?`
-).bind(id).run();
+`UPDATE accompagnements SET statut='finalise', finalized_at=datetime('now'), updated_at=datetime('now'), itinerant_email=? WHERE id=?`
+).bind(session.email || null, id).run();
 return new Response(JSON.stringify({ ok: true }), {
 status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
@@ -3255,6 +3333,239 @@ return new Response(JSON.stringify({ ok: true }), {
 status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
 }
+
+// ---------- Accompagnement Manager — lot 1 (23/09/2026) ----------
+// Données magasin agrégées pour pré-remplir un compte-rendu en un seul appel :
+// référentiel, indicateurs de santé (score, Google, Kaizen, niveau équipe),
+// collaborateurs RH + dernières stats PEDLV, tâches Évaluation Équipe actives
+// avec la note du magasin, actions en cours du dernier bilan de passage.
+// Aucune nouvelle logique de calcul : tout est repris des fonctions existantes
+// (buildStoreHealthResults, requêtes de /rh-collaborateurs, /collab-stats,
+// /evaluation/magasin). Le front fige ces valeurs dans contenu_json.
+if (url.pathname === '/accompagnement-magasin-data') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const code = url.searchParams.get('code');
+if (!code) return jsonError('Paramètre code requis', 400, corsHeaders);
+try {
+const stores = await getMagasinsServerSide();
+const store = stores.find(s => s.code === code);
+if (!store) return jsonError('Magasin inconnu dans magasins.csv', 404, corsHeaders);
+
+// 1. Santé (score + sous-scores, Google, Kaizen, niveau équipe, actions)
+const [h] = await buildStoreHealthResults(env, [store]);
+
+// 2. Collaborateurs du dernier mois RH + dernières stats PEDLV
+const moisRow = await env.DB.prepare(
+`SELECT MAX(mois) as mois FROM rh_effectif_site_mensuel WHERE code_site = ? AND site_reconnu = 1`
+).bind(code).first();
+const moisRh = moisRow && moisRow.mois;
+let collaborateurs = [];
+if (moisRh) {
+const { results } = await env.DB.prepare(
+`SELECT es.matricule, em.prenom, em.nom, em.poste
+FROM rh_effectif_site_mensuel es
+JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
+WHERE es.code_site = ? AND es.mois = ? AND es.site_reconnu = 1
+ORDER BY em.nom`
+).bind(code, moisRh).all();
+collaborateurs = (results || []).map(r => ({
+matricule: r.matricule,
+nom: ((r.prenom || '') + ' ' + (r.nom || '')).trim(),
+poste: r.poste || '',
+stats: null,
+}));
+}
+if (collaborateurs.length) {
+// Matricules RH sur 10 chiffres vs PEDLV sans zéros de tête (voir /collab-stats)
+const matKey = m => String(m).trim().replace(/^0+/, '');
+const matricules = [...new Set(collaborateurs.map(c => matKey(c.matricule)))];
+const placeholders = matricules.map(() => '?').join(',');
+const { results: statsRows } = await env.DB.prepare(
+`SELECT c1.matricule, c1.periode,
+c1.nb_vente_opt AS nbVenteOpt, c1.tx_concret_opt AS txConcretOpt, c1.sop AS sop,
+c1.pack_confort_pct AS packConfortPct, c1.pack_confort_pm AS packConfortPm, c1.mdc AS mdc,
+c1.pct_test_auditif AS pctTestAuditif, c1.pm_audio AS pmAudio, c1.tx_concret_audio AS txConcretAudio,
+c1.ap4 AS ap4, c1.ca_accessoires_pct AS caAccessoiresPct,
+c1.pm_opt AS pmOpt, c1.ca_audio AS caAudio
+FROM collab_stats_mensuel c1
+INNER JOIN (
+SELECT LTRIM(matricule, '0') AS mk, MAX(periode) AS maxp FROM collab_stats_mensuel WHERE LTRIM(matricule, '0') IN (${placeholders}) GROUP BY LTRIM(matricule, '0')
+) c2 ON LTRIM(c1.matricule, '0') = c2.mk AND c1.periode = c2.maxp`
+).bind(...matricules).all();
+const parMatricule = {};
+for (const r of (statsRows || [])) parMatricule[matKey(r.matricule)] = r;
+for (const c of collaborateurs) c.stats = parMatricule[matKey(c.matricule)] || null;
+}
+
+// 3. Tâches actives Évaluation Équipe + note du magasin (moyenne des 3 meilleures)
+const annee = anneeCouranteEval();
+const { results: tachesRows } = await env.DB.prepare(
+`SELECT DISTINCT tache FROM criteres_taches WHERE active_depuis_annee <= ? ORDER BY tache`
+).bind(annee).all();
+const { results: notesRows } = await env.DB.prepare(
+`SELECT tache, note FROM notes_equipe WHERE magasin_code = ? AND annee = ?`
+).bind(code, annee).all();
+const notesParTache = {};
+for (const n of (notesRows || [])) (notesParTache[n.tache] ??= []).push(n.note);
+const taches = (tachesRows || []).map(t => {
+const top3 = [...(notesParTache[t.tache] || [])].sort((a, b) => b - a).slice(0, 3);
+return {
+tache: t.tache,
+note: top3.length ? Math.round((top3.reduce((s, n) => s + n, 0) / top3.length) * 10) / 10 : null,
+};
+});
+
+// 4. Actions en cours du dernier bilan de passage (texte complet)
+let actions = [];
+if (h && h.lastBilanDate) {
+const row = await env.DB.prepare(
+'SELECT data_json FROM bilans WHERE magasin_code = ? ORDER BY date DESC, id DESC LIMIT 1'
+).bind(code).first();
+let data = {};
+try { data = JSON.parse(row?.data_json || '{}'); } catch (e) {}
+actions = (Array.isArray(data.actions) ? data.actions : []).map(a => ({
+text: a.text || '',
+comment: a.comment || '',
+who: a.who || '',
+date: a.date || '',
+status: a._status || null,
+repriseCount: a._repriseCount || 0,
+}));
+}
+
+return new Response(JSON.stringify({
+ok: true,
+capturedAt: new Date().toISOString(),
+magasin: {
+code: store.code, libelle: store.libelle, manager: store.manager, email: store.email,
+animateur: store.animateur, animateurEmail: store.animateurEmail,
+},
+sante: {
+score: h ? h.score : null,
+subScores: h ? h.subScores : null,
+googleRating: h ? h.googleRating : null,
+kaizenScoreMois: h ? h.kaizenScoreMois : null,
+kaizenScoreMaxMois: h ? h.kaizenScoreMaxMois : null,
+kaizenCumulAnnuel: h ? h.kaizenCumulAnnuel : null,
+niveauEquipe: h ? h.niveauEquipe : null,
+objectifNiveauEquipe: OBJECTIF_NIVEAU_EQUIPE,
+},
+collaborateurs: { moisRh: moisRh || null, liste: collaborateurs },
+taches,
+dernierBilan: { date: h ? h.lastBilanDate : null, actions },
+}), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur lecture données magasin : ' + String(e), 500, corsHeaders);
+}
+}
+
+// Référentiel des items SWOT, commun à tous les itinérants. Les items de base
+// (liste fournie par Olivier) ont origine='base', ceux ajoutés depuis l'appli
+// origine='ajout'. Suppression = désactivation (actif=0) : les comptes-rendus
+// existants gardent le libellé copié dans leur contenu_json.
+if (url.pathname === '/accompagnement-swot-items') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+const { results } = await env.DB.prepare(
+`SELECT id, libelle, origine, cree_par FROM accompagnement_swot_items WHERE actif = 1 ORDER BY ordre, libelle`
+).all();
+return new Response(JSON.stringify({ ok: true, items: results || [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur lecture items SWOT : ' + String(e), 500, corsHeaders);
+}
+}
+
+if (url.pathname === '/accompagnement-swot-item-save') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const { id, libelle } = await request.json();
+const lib = String(libelle || '').trim();
+if (!lib) return jsonError('Libellé requis', 400, corsHeaders);
+try {
+const doublon = await env.DB.prepare(
+`SELECT id FROM accompagnement_swot_items WHERE actif = 1 AND LOWER(libelle) = LOWER(?) AND id != ?`
+).bind(lib, id || 0).first();
+if (doublon) return jsonError('Cet item existe déjà', 409, corsHeaders);
+if (id) {
+await env.DB.prepare(`UPDATE accompagnement_swot_items SET libelle = ?, updated_at = datetime('now') WHERE id = ?`).bind(lib, id).run();
+return new Response(JSON.stringify({ ok: true, id }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+const maxRow = await env.DB.prepare(`SELECT COALESCE(MAX(ordre), 0) AS m FROM accompagnement_swot_items`).first();
+const result = await env.DB.prepare(
+`INSERT INTO accompagnement_swot_items (libelle, origine, cree_par, ordre) VALUES (?, 'ajout', ?, ?)`
+).bind(lib, session.nom, (maxRow?.m || 0) + 1).run();
+return new Response(JSON.stringify({ ok: true, id: result.meta.last_row_id }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur enregistrement item SWOT : ' + String(e), 500, corsHeaders);
+}
+}
+
+if (url.pathname === '/accompagnement-swot-item-delete') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const { id } = await request.json();
+if (!id) return jsonError('Paramètre id requis', 400, corsHeaders);
+try {
+await env.DB.prepare(`UPDATE accompagnement_swot_items SET actif = 0, updated_at = datetime('now') WHERE id = ?`).bind(id).run();
+return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur suppression item SWOT : ' + String(e), 500, corsHeaders);
+}
+}
+// ---------- Fin Accompagnement Manager — lot 1 ----------
+// ---------- Accompagnement Manager — relances à 90 jours (24/09/2026) ----------
+// Déclenché chaque matin par cron-job.org (les 5 Cron Triggers Cloudflare sont
+// pris), protégé par un secret dédié CRONJOB_SECRET (en-tête X-Cron-Token ou
+// ?token=). Pour chaque compte-rendu finalisé arrivé à J+90 : mail de rappel à
+// l'itinérant avec un lien vers l'appli, d'où il/elle envoie lui-même la
+// relance au magasin depuis sa boîte (même mécanisme que Bilan de Passage).
+// &dry=1 : liste ce qui partirait, sans rien envoyer ni rien marquer.
+if (url.pathname === '/cron/accompagnement-relances') {
+const cronToken = request.headers.get('X-Cron-Token') || url.searchParams.get('token');
+if (!env.CRONJOB_SECRET || cronToken !== env.CRONJOB_SECRET) return new Response('Non autorisé', { status: 401, headers: corsHeaders });
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const dry = url.searchParams.get('dry') === '1';
+try {
+const report = await runAccompagnementRelances(env, { dry });
+return new Response(JSON.stringify({ ok: true, dry, ...report }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+if (!dry) {
+try { await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject: '⚠️ Échec — relances Accompagnement Manager', bodyText: 'Erreur le ' + new Date().toISOString() + ' :\n' + (e && e.stack ? e.stack : String(e)) }); } catch (mailErr) { console.error(mailErr); }
+}
+return jsonError('Erreur relances accompagnement : ' + String(e), 500, corsHeaders);
+}
+}
+
+// Case « Pas de relance » — modifiable même sur un compte-rendu finalisé.
+if (url.pathname === '/accompagnement-relance-toggle') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const { id, desactivee } = await request.json();
+if (!id) return jsonError('Paramètre id requis', 400, corsHeaders);
+await env.DB.prepare('UPDATE accompagnements SET relance_desactivee = ? WHERE id = ?').bind(desactivee ? 1 : 0, id).run();
+return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
+// Appelé par l'appli une fois la relance au magasin envoyée depuis la boîte
+// de l'itinérant (l'envoi lui-même se fait côté client, comme la finalisation).
+if (url.pathname === '/accompagnement-relance-magasin-sent') {
+const { session, error } = await requireAccompSession(request, corsHeaders);
+if (error) return error;
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const { id } = await request.json();
+if (!id) return jsonError('Paramètre id requis', 400, corsHeaders);
+await env.DB.prepare(`UPDATE accompagnements SET relance_magasin_at = datetime('now') WHERE id = ?`).bind(id).run();
+return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+// ---------- Fin relances à 90 jours ----------
+
 
 if (url.pathname === '/store-bilan') {
 const storeToken = request.headers.get('X-Store-Token');
@@ -4386,7 +4697,12 @@ try {
 const matricules = (url.searchParams.get('matricules') || '').split(',').map(s => s.trim()).filter(Boolean);
 if (!matricules.length) return new Response(JSON.stringify({ ok: true, collaborateurs: {} }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
-const placeholders = matricules.map(() => '?').join(',');
+// 23/09 : l'import RH stocke les matricules sur 10 chiffres ("0000002488"),
+// PEDLV sans les zéros de tête ("2488") — comparaison sur LTRIM(...,'0') des
+// deux côtés, réponse indexée par le matricule tel que demandé.
+const matKey = m => String(m).trim().replace(/^0+/, '');
+const keys = [...new Set(matricules.map(matKey))];
+const placeholders = keys.map(() => '?').join(',');
 const { results } = await env.DB.prepare(
 `SELECT c1.matricule, c1.periode, c1.nom_vendeur,
 c1.pm_opt AS pmOpt, c1.mdc AS mdc, c1.nb_vente_opt AS nbVenteOpt, c1.sop AS sop,
@@ -4395,12 +4711,14 @@ c1.pm_1ere_paire AS pm1erePaire, c1.pm_audio AS pmAudio, c1.tx_concret_audio AS 
 c1.ap4 AS ap4, c1.pct_test_auditif AS pctTestAuditif, c1.ca_audio AS caAudio, c1.ca_accessoires_pct AS caAccessoiresPct
 FROM collab_stats_mensuel c1
 INNER JOIN (
-SELECT matricule, MAX(periode) AS maxp FROM collab_stats_mensuel WHERE matricule IN (${placeholders}) GROUP BY matricule
-) c2 ON c1.matricule = c2.matricule AND c1.periode = c2.maxp`
-).bind(...matricules).all();
+SELECT LTRIM(matricule, '0') AS mk, MAX(periode) AS maxp FROM collab_stats_mensuel WHERE LTRIM(matricule, '0') IN (${placeholders}) GROUP BY LTRIM(matricule, '0')
+) c2 ON LTRIM(c1.matricule, '0') = c2.mk AND c1.periode = c2.maxp`
+).bind(...keys).all();
 
+const parCle = {};
+for (const row of results) parCle[matKey(row.matricule)] = row;
 const collaborateurs = {};
-for (const row of results) collaborateurs[row.matricule] = row;
+for (const m of matricules) { const row = parCle[matKey(m)]; if (row) collaborateurs[m] = { ...row, matricule: m }; }
 return new Response(JSON.stringify({ ok: true, collaborateurs }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture stats collaborateur : ' + String(e), 500, corsHeaders);
