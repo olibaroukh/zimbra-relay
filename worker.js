@@ -1892,7 +1892,7 @@ const s = entry.stat;
 const parts = [
 s.ca_total !== null ? `CA: ${Number(s.ca_total).toFixed(1)}k€` : '',
 s.objectif !== null ? `objectif: ${Number(s.objectif).toFixed(1)}k€` : '',
-s.raf !== null ? `RAF: ${Number(s.raf).toFixed(1)}k€` : '',
+s.raf !== null ? `RAF/jour: ${Number(s.raf).toFixed(1)}k€` : '',
 s.panier_moyen !== null ? `panier moyen: ${Number(s.panier_moyen).toFixed(0)}€` : '',
 ].filter(Boolean).join(', ');
 const topPrios = (entry.stat.prios || []).slice(0, 2).map(p => p.titre).filter(Boolean);
@@ -3785,9 +3785,14 @@ equipe: r.score_equipe, kaizen: r.score_kaizen, entretiens: r.score_entretiens, 
 // --- Positionnement mensuel (Pedlv) + annuel (dernier bilan de passage) ---
 const storeStatsMap = await getStoreStatsMap(env);
 const statsRow = storeStatsMap[normalizeName(store.libelle)] || null;
+// Positionnement mensuel (24/09) : valeur calculée et envoyée par PEDLV
+// (projection fin de mois, identique au KPI affiché dans PEDLV). Ne plus le
+// recalculer ici : store_stats.raf est un RAF PAR JOUR, pas le reste à faire
+// total, et (objectif - raf) / objectif donnait un chiffre proche de 100 %.
+// Les lignes antérieures à ce correctif n'ont pas la colonne -> null.
 let positionnementMensuel = null;
-if (statsRow && statsRow.objectif) {
-positionnementMensuel = Math.round(((statsRow.objectif - (statsRow.raf || 0)) / statsRow.objectif) * 1000) / 10;
+if (statsRow && statsRow.positionnement != null) {
+positionnementMensuel = Math.round(Number(statsRow.positionnement) * 10) / 10;
 }
 
 // --- Pedlv détaillé : les 8 indicateurs du score santé, avec ancienneté si rouge ---
@@ -4279,8 +4284,8 @@ try {
 const s = await request.json();
 if (!s.magasin) return jsonError('Champ magasin requis', 400, corsHeaders);
 await env.DB.prepare(
-`INSERT INTO store_stats (magasin, code_magasin, periode, date_extraction, ca_total, ca_opt, ca_audio, panier_moyen, taux_tc, taux_sop, taux_mdc, protheses_vendues, taux_essai, objectif, raf, prios_json, taux_test_auditif, taux_vente_add_audio, taux_pack_confort, pm_pack_confort, indicateurs_json, nb_vente_opt, jours_ouvres_mois)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+`INSERT INTO store_stats (magasin, code_magasin, periode, date_extraction, ca_total, ca_opt, ca_audio, panier_moyen, taux_tc, taux_sop, taux_mdc, protheses_vendues, taux_essai, objectif, raf, prios_json, taux_test_auditif, taux_vente_add_audio, taux_pack_confort, pm_pack_confort, indicateurs_json, nb_vente_opt, jours_ouvres_mois, positionnement)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 ).bind(
 s.magasin, s.codeMagasin || null, s.periode || null, s.dateExtraction || null,
 s.caTotal ?? null, s.caOpt ?? null, s.caAudio ?? null, s.panierMoyen ?? null,
@@ -4289,7 +4294,8 @@ s.prothesesVendues ?? null, s.tauxEssai ?? null, s.objectif ?? null, s.raf ?? nu
 JSON.stringify(s.prios || []),
 s.tauxTestAuditif ?? null, s.tauxVenteAddAudio ?? null,
 s.tauxPackConfort ?? null, s.pmPackConfort ?? null,
-JSON.stringify(s.indicateurs || {}), s.nbVenteOpt ?? null, s.joursOuvresMois ?? null
+JSON.stringify(s.indicateurs || {}), s.nbVenteOpt ?? null, s.joursOuvresMois ?? null,
+(s.positionnement != null && isFinite(Number(s.positionnement))) ? Number(s.positionnement) : null
 ).run();
 
 try {
@@ -4785,10 +4791,10 @@ if (!row) return new Response(JSON.stringify({ ok: true, periode: null }), { sta
 
 const caTotal = row.ca_total != null ? Number(row.ca_total) : null;
 const caAudio = row.ca_audio != null ? Number(row.ca_audio) : null;
-const objectif = row.objectif != null ? Number(row.objectif) : null;
-const raf = row.raf != null ? Number(row.raf) : null;
-const positionnementMensuel = (objectif && objectif !== 0)
-? Math.round(((objectif - (raf || 0)) / objectif) * 1000) / 10
+// Positionnement (24/09) : repris tel quel de PEDLV (colonne positionnement),
+// voir la fiche magasin — raf est un RAF par jour, inutilisable pour ce calcul.
+const positionnementMensuel = row.positionnement != null
+? Math.round(Number(row.positionnement) * 10) / 10
 : null;
 const caAudioMagPct = (caTotal && caTotal !== 0 && caAudio != null)
 ? Math.round((caAudio / caTotal) * 1000) / 10
