@@ -1270,6 +1270,55 @@ stuck.forEach(it => out.push({ libelle: s.libelle, animateur: s.animateur, indic
 return out;
 }
 
+const CHECKLIST_RESEAU_KEY = '__reseau__';
+
+function sanitizeChecklistItems(list) {
+const items = [];
+const vus = new Set();
+for (const it of (list || [])) {
+const texte = String((it && it.texte) || '').trim().slice(0, 300);
+const id = String((it && it.id) || '').trim().slice(0, 40);
+if (!texte || !id || vus.has(id)) continue;
+vus.add(id);
+items.push({ id, texte });
+}
+return items;
+}
+
+async function readChecklistItems(env, cle) {
+const row = await env.DB.prepare('SELECT items_json FROM ar_checklist WHERE ar = ?').bind(cle).first();
+try { return sanitizeChecklistItems(JSON.parse((row && row.items_json) || '[]')); } catch (e) { return []; }
+}
+
+// Récap hebdo d'Olivier : points réseau de la checklist oubliés (non cochés) sur
+// les bilans de la semaine, agrégés par AR et par point — "oublié sur X passages
+// sur Y". Section absente si aucun oubli (ou aucun bilan portant la checklist).
+function htmlChecklistReseauOubliesSection(byAR) {
+const rows = [];
+for (const [ar, bilans] of Object.entries(byAR || {})) {
+const parPoint = {};
+for (const b of (bilans || [])) {
+const liste = Array.isArray(b && b.checklistReseau) ? b.checklistReseau : [];
+for (const it of liste) {
+if (!it || !it.id) continue;
+const e = (parPoint[it.id] ??= { texte: it.texte || it.id, total: 0, oublis: 0, magasins: [] });
+e.total++;
+if (!it.coche) {
+e.oublis++;
+const lib = (b.magasin && b.magasin.libelle) || '';
+if (lib && !e.magasins.includes(lib)) e.magasins.push(lib);
+}
+}
+}
+Object.values(parPoint).filter(e => e.oublis > 0).forEach(e => {
+rows.push([ar, e.texte, `${e.oublis} sur ${e.total}`, e.magasins.join(', ')]);
+});
+}
+if (!rows.length) return '';
+const title = `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">☑️ Checklist réseau — points oubliés cette semaine</h3>`;
+return title + htmlStatsTable(['Animateur', 'Point', 'Oublié (passages)', 'Magasins'], rows);
+}
+
 function htmlStuckPedlvIndicateursSection(items, scopeLabel) {
 const title = `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">🔁 Indicateurs PEDLV rouges depuis plusieurs semaines</h3>`;
 if (!items.length) {
@@ -2421,7 +2470,8 @@ const unmatchedSection = htmlUnmatchedNamesSection(unmatchedNames || []);
 const stuckActionsSection = htmlStuckActionsSection(stuckActionsAll, 'du réseau');
 const stuckPedlvSection = htmlStuckPedlvIndicateursSection(stuckPedlvAll, 'du réseau');
 const gaugeSection = htmlEntretiensLancementsGaugeSection(stores.filter(s => s.animateur), entretiensLancementsMap, 'du réseau');
-await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject, bodyHtml: wrapEmailBody(olivierTable + olivierBullets + stuckActionsSection + stuckPedlvSection + unmatchedSection + gaugeSection) });
+const checklistSection = htmlChecklistReseauOubliesSection(byAR);
+await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject, bodyHtml: wrapEmailBody(olivierTable + olivierBullets + checklistSection + stuckActionsSection + stuckPedlvSection + unmatchedSection + gaugeSection) });
 await saveWeeklyReport(env, 'bilan_hebdo', 'ALL', from, to, bulletsToText(byArBullets));
 }
 
@@ -3132,7 +3182,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -3925,6 +3975,28 @@ return { tache, responsable: fiche ? fiche.responsable : null, moyenne };
 // --- Manager du magasin (colonne manager de magasins.csv, plus simple et plus fiable que l'import RH) ---
 const manager = store.manager || null;
 
+// --- Checklist réseau (24/09) : état des points réseau sur les 6 derniers
+// bilans du magasin qui la portent (bilans envoyés depuis la mise en place).
+let checklistReseauPassages = [];
+try {
+const { results: ckRows } = await env.DB.prepare(
+'SELECT date, ar, passage, data_json FROM bilans WHERE magasin_code = ? ORDER BY date DESC, id DESC LIMIT 20'
+).bind(code).all();
+for (const r of ckRows) {
+let dj = {};
+try { dj = JSON.parse(r.data_json || '{}'); } catch(e) {}
+const liste = Array.isArray(dj.checklistReseau) ? dj.checklistReseau.filter(it => it && it.id) : [];
+if (!liste.length) continue;
+checklistReseauPassages.push({
+date: r.date, ar: r.ar, passage: r.passage,
+total: liste.length,
+coches: liste.filter(it => it.coche).length,
+oublis: liste.filter(it => !it.coche).map(it => it.texte || it.id),
+});
+if (checklistReseauPassages.length >= 6) break;
+}
+} catch(e) { checklistReseauPassages = []; }
+
 // --- CA prévisionnel annuel = objectif annuel (magasins.csv, en k€) × positionnement annuel (%) ---
 const caPrevisionnelAnnuel = (store.objectifAnnuel !== null && base.positionnementAnnuel !== null && base.positionnementAnnuel !== undefined)
 ? Math.round(store.objectifAnnuel * base.positionnementAnnuel) / 100
@@ -3942,6 +4014,7 @@ pedlvIndicateurs,
 kaizenPointsNonResolus,
 equipeTaches,
 manager,
+checklistReseauPassages,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur détail magasin : ' + String(e), 500, corsHeaders);
@@ -5143,6 +5216,56 @@ return jsonError('Erreur lecture google_ratings : ' + String(e), 500, corsHeader
 // Poids du score de santé (source unique — voir getHealthWeights). GET public
 // en lecture (déjà visible côté client de toute façon), POST réservé à
 // Olivier via la modale ⚖️ de bilan-passage/index.html.
+// --- Checklist de passage (24/09) ---
+// Deux listes, toutes deux en base (table ar_checklist, une ligne par AR +
+// une ligne spéciale CHECKLIST_RESEAU_KEY pour les points réseau) :
+// - points personnels : aide-mémoire propre à chaque AR (identifié par sa
+//   session /ar-login), jamais remontés — leurs cases restent dans le navigateur ;
+// - points réseau : créés par Olivier seul (session 'ALL'), affichés à tous les
+//   AR ; leur état coché / non coché est envoyé avec le bilan (data_json.checklistReseau)
+//   et repris dans le dashboard et le récap hebdo d'Olivier.
+// Table : ar_checklist (ar TEXT PRIMARY KEY, items_json TEXT, updated_at TEXT).
+if (url.pathname === '/ar-checklist' || url.pathname === '/ar-checklist-reseau') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+const jsonOk = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+try {
+// Sans session valide : les points réseau restent lisibles (tous les AR
+// doivent les voir, même non connectés) ; les points perso et toute
+// écriture exigent la session.
+if (!sessionAr) {
+if (request.method === 'GET') {
+const reseau = await readChecklistItems(env, CHECKLIST_RESEAU_KEY);
+return jsonOk({ ok: true, ar: null, estOlivier: false, items: null, reseau, sessionRequise: true });
+}
+return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+}
+if (request.method === 'GET') {
+const perso = await readChecklistItems(env, sessionAr);
+const reseau = await readChecklistItems(env, CHECKLIST_RESEAU_KEY);
+return jsonOk({ ok: true, ar: sessionAr, estOlivier: sessionAr === 'ALL', items: perso, reseau });
+}
+const body = await request.json().catch(() => null);
+if (!body || !Array.isArray(body.items)) return jsonError('items (tableau) requis', 400, corsHeaders);
+if (body.items.length > 100) return jsonError('100 points maximum', 400, corsHeaders);
+let cle = sessionAr;
+if (url.pathname === '/ar-checklist-reseau') {
+if (sessionAr !== 'ALL') return jsonError('Seul Olivier peut modifier les points réseau', 403, corsHeaders);
+cle = CHECKLIST_RESEAU_KEY;
+}
+const items = sanitizeChecklistItems(body.items);
+await env.DB.prepare(
+`INSERT INTO ar_checklist (ar, items_json, updated_at) VALUES (?, ?, ?)
+ON CONFLICT(ar) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at`
+).bind(cle, JSON.stringify(items), new Date().toISOString()).run();
+return jsonOk({ ok: true, items });
+} catch (e) {
+return jsonError('Erreur checklist : ' + String(e), 500, corsHeaders);
+}
+}
+
 if (url.pathname === '/health-weights' && request.method === 'GET') {
 const storeToken = request.headers.get('X-Store-Token');
 if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
