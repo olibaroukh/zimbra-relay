@@ -16,14 +16,31 @@ const NOTIFY_SECRET = 'OC-bilan-notify-2026';
 // À changer si compromis — doit correspondre à STORE_SECRET dans index.html / dashboard
 const STORE_SECRET = 'OC-bilan-store-2026';
 
-// Clé de signature interne des sessions animateur (HMAC), jamais exposée côté client
-const AR_SESSION_SECRET = 'OC-bilan-arsession-2026-signing-key';
+// Clé de signature des sessions animateur (HMAC) — 26/09 : sortie du code
+// (le repo est public, l'ancienne clé en clair permettait de fabriquer une
+// session "ALL"). Lue depuis le secret Cloudflare AR_SESSION_KEY au début de
+// chaque requête / cron (voir chargerClesSession). Sans secret : aucune
+// session ne peut être créée ni validée.
+let AR_SESSION_SECRET = null;
 const AR_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12h
 
 // ---------- Accompagnement Manager (08/09) ----------
 // Un seul itinérant pour l'instant (Emilie) — liste à étendre ici quand
 // d'autres itinérants rejoindront, sans nouvelle colonne magasins.csv.
-const ACCOMP_SESSION_SECRET = 'OC-accomp-arsession-2026-signing-key';
+// Idem, secret Cloudflare ACCOMP_SESSION_KEY (26/09).
+let ACCOMP_SESSION_SECRET = null;
+// Routes de test / debug (26/09, sécurité) : protégées par le secret
+// Cloudflare ADMIN_KEY — jamais écrit dans le code ni dans une page publique,
+// contrairement à STORE_SECRET. Passé en ?token=... (appel manuel depuis le
+// navigateur) ou en en-tête X-Admin-Key.
+function estAdmin(request, url, env) {
+const t = request.headers.get('X-Admin-Key') || url.searchParams.get('token') || '';
+return !!(env && env.ADMIN_KEY) && t === env.ADMIN_KEY;
+}
+function chargerClesSession(env) {
+AR_SESSION_SECRET = (env && env.AR_SESSION_KEY) || null;
+ACCOMP_SESSION_SECRET = (env && env.ACCOMP_SESSION_KEY) || null;
+}
 const ACCOMP_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12h, même convention que /ar-login
 const ACCOMP_ALLOWED_EMAILS = ['emilie.nahon@optical-center.com', 'olivier.baroukh@optical-center.com'];
 const MAGASINS_CSV_URL = 'https://raw.githubusercontent.com/olibaroukh/bilan-passage/main/magasins.csv';
@@ -796,6 +813,7 @@ return { libelle: best.store.libelle, code: best.store.code, distance: best.dist
 }
 
 async function hmacSign(payloadStr) {
+if (!AR_SESSION_SECRET) throw new Error('Secret AR_SESSION_KEY absent du Worker');
 const enc = new TextEncoder();
 const key = await crypto.subtle.importKey('raw', enc.encode(AR_SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
 const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
@@ -810,6 +828,7 @@ return b64 + '.' + sig;
 }
 
 async function verifyArSession(token) {
+if (!AR_SESSION_SECRET) return null;
 if (!token || !token.includes('.')) return null;
 const [b64, sig] = token.split('.');
 const expectedSig = await hmacSign(b64);
@@ -825,6 +844,7 @@ return payload.ar;
 // un payload {email, nom, exp} plutôt que {ar, exp} — domaine différent (itinérants,
 // pas animateurs réseau), pas de raison de partager la clé de signature.
 async function accompHmacSign(payloadStr) {
+if (!ACCOMP_SESSION_SECRET) throw new Error('Secret ACCOMP_SESSION_KEY absent du Worker');
 const enc = new TextEncoder();
 const key = await crypto.subtle.importKey('raw', enc.encode(ACCOMP_SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
 const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
@@ -839,6 +859,7 @@ return b64 + '.' + sig;
 }
 
 async function verifyAccompSession(token) {
+if (!ACCOMP_SESSION_SECRET) return null;
 if (!token || !token.includes('.')) return null;
 const [b64, sig] = token.split('.');
 const expectedSig = await accompHmacSign(b64);
@@ -3237,6 +3258,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 
 export default {
 async fetch(request, env) {
+chargerClesSession(env);
 await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
@@ -5133,8 +5155,7 @@ return jsonError('Erreur génération com hebdo : ' + String(e), 500, corsHeader
 }
 
 if (url.pathname === '/test-com-hebdo') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 const sendMode = url.searchParams.get('send');
 const arFilter = url.searchParams.get('ar');
@@ -5157,8 +5178,7 @@ return jsonError('Erreur génération/envoi com hebdo : ' + String(e), 500, cors
 }
 
 if (url.pathname === '/test-weekly-report') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 const sendEmail = url.searchParams.get('send') === '1';
 const arFilter = url.searchParams.get('ar');
@@ -5188,8 +5208,7 @@ return jsonError('Erreur génération/envoi du rapport : ' + String(e), 500, cor
 }
 
 if (url.pathname === '/debug-magasins-non-reconnus') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 try {
 const stores = await getMagasinsServerSide();
@@ -5221,8 +5240,7 @@ return jsonError('Erreur calcul noms non reconnus : ' + String(e), 500, corsHead
 }
 
 if (url.pathname === '/test-monthly-report') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 const sendEmail = url.searchParams.get('send') === '1';
 const overrideFrom = url.searchParams.get('from');
@@ -5244,8 +5262,7 @@ return jsonError('Erreur génération/envoi du bilan mensuel : ' + String(e), 50
 }
 
 if (url.pathname === '/test-kaizen-cloture') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 // mois au format YYYY-MM, optionnel — par défaut le mois précédent (comportement réel du cron)
 const moisParam = url.searchParams.get('mois');
@@ -5376,8 +5393,7 @@ return jsonError('Erreur écriture health_weights : ' + String(e), 500, corsHead
 }
 
 if (url.pathname === '/test-google-ratings-refresh') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 try {
 await refreshGoogleRatings(env);
@@ -5389,8 +5405,7 @@ return jsonError('Erreur refresh Google ratings : ' + String(e), 500, corsHeader
 }
 
 if (url.pathname === '/test-visit-reminders') {
-const storeToken = request.headers.get('X-Store-Token') || url.searchParams.get('token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!estAdmin(request, url, env)) return jsonError('Non autorisé', 401, corsHeaders);
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 const sendEmail = url.searchParams.get('send') === '1';
 try {
@@ -6141,7 +6156,7 @@ if (url.pathname.startsWith('/nutrition-log') && request.method === 'OPTIONS') {
 
 if (url.pathname === '/nutrition-log' && request.method === 'POST') {
   const _nt1 = request.headers.get('X-Store-Token') || '';
-  if (_nt1 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  if (!env.NUTRITION_KEY || _nt1 !== env.NUTRITION_KEY) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
   let body;
   try { body = await request.json(); } catch { return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } }); }
   const { type, name, date, checked } = body;
@@ -6162,7 +6177,7 @@ if (url.pathname === '/nutrition-log' && request.method === 'POST') {
 
 if (url.pathname === '/nutrition-log/ping') {
   const _nt2 = request.headers.get('X-Store-Token') || '';
-  if (_nt2 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  if (!env.NUTRITION_KEY || _nt2 !== env.NUTRITION_KEY) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
   try {
     const result = await env.DB.prepare('SELECT COUNT(*) as cnt FROM nutrition_log').first();
     return new Response(JSON.stringify({ ok: true, rows: result.cnt }), { status: 200, headers: { 'Content-Type': 'application/json', ...nutCors } });
@@ -6173,7 +6188,7 @@ if (url.pathname === '/nutrition-log/ping') {
 
 if (url.pathname === '/nutrition-log/summary') {
   const _nt3 = request.headers.get('X-Store-Token') || '';
-  if (_nt3 !== STORE_SECRET) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
+  if (!env.NUTRITION_KEY || _nt3 !== env.NUTRITION_KEY) return new Response(JSON.stringify({ error: 'Non autorise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...nutCors } });
   const date = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return new Response(JSON.stringify({ error: 'Format date invalide' }), { status: 400, headers: { 'Content-Type': 'application/json', ...nutCors } });
   try {
@@ -6211,6 +6226,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 },
 
 async scheduled(event, env, ctx) {
+chargerClesSession(env);
 await chargerObjectifsReseauPedlv();
 const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
