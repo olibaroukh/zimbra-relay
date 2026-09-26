@@ -1797,6 +1797,13 @@ return hier > 0 ? hier : compterJoursAttendus(mois, alsaceMoselle, fermSet, toda
 // (voir joursAttendusLancement), plus le déclaratif PEDLV ni l'estimation RH.
 // `moisCible` (YYYY-MM) optionnel : utilisé par le bilan mensuel du 1er pour
 // calculer le mois écoulé (sans lui, le 1er renvoyait le mois qui commence).
+// Types d'entretien qui comptent dans la couverture « entretiens individuels »
+// (26/09, Suivi Managers v2) — UNE seule liste, lue par le score de santé, le
+// tableau du récap mensuel et la jauge hebdo. Recadrage toujours hors calcul.
+// Écoute & Feedback volontairement absente (règle du 18/09 maintenue le 26/09,
+// à rediscuter avec les équipes terrain) : pour l'inclure, ajouter 'ecoute_fb'.
+const TYPES_ENTRETIENS_COMPTES = ['pilotage_optique', 'pilotage_audio', 'valorisation', 'remotivation'];
+
 async function getEntretiensLancementsMap(env, moisCible) {
 if (!env.DB) return {};
 const moisActuel = moisCible || parisTodayIso().slice(0, 7);
@@ -1824,9 +1831,9 @@ try {
 ({ results: entretienRows } = await env.DB.prepare(
 `SELECT DISTINCT magasin_code, collaborateur_matricule
 FROM entretiens_manager
-WHERE date LIKE ? AND type IN ('pilotage_optique','pilotage_audio')
+WHERE date LIKE ? AND type IN (${TYPES_ENTRETIENS_COMPTES.map(() => '?').join(',')})
 AND collaborateur_matricule IS NOT NULL`
-).bind(moisActuel + '%').all());
+).bind(moisActuel + '%', ...TYPES_ENTRETIENS_COMPTES).all());
 } catch (e) {}
 const vusParMagasin = {};
 entretienRows.forEach(r => {
@@ -1888,11 +1895,13 @@ const tc = typeCountsParMagasin[code] || {};
 const nbPilotage = (tc.pilotage_optique || 0) + (tc.pilotage_audio || 0);
 const nbEcouteFb = tc.ecoute_fb || 0;
 const nbRecadrage = tc.recadrage || 0;
+const nbValorisation = tc.valorisation || 0;
+const nbRemotivation = tc.remotivation || 0;
 
 map[code] = {
 tauxEntretiens, nbEligibles: eligibles.size, nbVus,
 tauxLancements, joursOuverts: joursOuverts || 0, joursLances,
-nbPilotage, nbEcouteFb, nbRecadrage, nbLancements: joursLances,
+nbPilotage, nbEcouteFb, nbRecadrage, nbValorisation, nbRemotivation, nbLancements: joursLances,
 };
 });
 return map;
@@ -1961,7 +1970,7 @@ kaizenCumulAnnuel: kz ? kz.cumulAnnuel : null,
 kaizenDernierScoreCloture: kz ? kz.dernierScoreCloture : null,
 kaizenDernierScoreMax: kz ? kz.dernierScoreMax : null,
 kaizenDernierMoisCloture: kz ? kz.dernierMoisCloture : null,
-entretiensLancements: entretiensLancementsMap[store.code] || { tauxEntretiens: 0, tauxLancements: 0, nbEligibles: 0, nbVus: 0, joursOuverts: 0, joursLances: 0, nbPilotage: 0, nbEcouteFb: 0, nbRecadrage: 0, nbLancements: 0 },
+entretiensLancements: entretiensLancementsMap[store.code] || { tauxEntretiens: 0, tauxLancements: 0, nbEligibles: 0, nbVus: 0, joursOuverts: 0, joursLances: 0, nbPilotage: 0, nbEcouteFb: 0, nbRecadrage: 0, nbValorisation: 0, nbRemotivation: 0, nbLancements: 0 },
 };
 // Score global + détail des 8 sous-scores — mêmes fonctions que le digest
 // hebdo et l'historisation (aucune nouvelle logique de calcul). Ajouté ici
@@ -2159,6 +2168,98 @@ return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margi
 // aucun PDF n'a pu être généré côté client (hasPdf=false), on retombe sur
 // l'ancien dump JSON + images de signature en repli, pour ne jamais perdre
 // le contenu même si le PDF échoue.
+// ── Suivi Managers v2 (26/09) : libellés, suivis datés, alertes ──
+// Libellés des trames — une seule table pour le mail, le bilan hebdo et les
+// alertes. Écoute & Feedback garde un seul `type` en base ('ecoute_fb') ; le
+// modèle choisi (4 trames au catalogue) est porté par data_json.modele.
+const LIBELLES_ENTRETIEN = {
+ecoute_fb: 'Écoute & Feedback de vente', pilotage_audio: 'Pilotage Audio', pilotage_optique: 'Pilotage Optique',
+recadrage: 'Entretien de recadrage', valorisation: 'Entretien de valorisation', remotivation: 'Entretien de remotivation',
+};
+const LIBELLES_MODELE_EFB = {
+taux_concretisation: 'Taux de concrétisation', decouverte_optique: 'Découverte client optique',
+decouverte_audio: 'Découverte client audio', vierge: 'Trame vierge',
+};
+const TYPES_ENTRETIEN_VALIDES = Object.keys(LIBELLES_ENTRETIEN);
+
+function libelleEntretien(type, data) {
+const base = LIBELLES_ENTRETIEN[type] || 'Entretien manager';
+if (type === 'ecoute_fb') {
+const modele = (data && data.modele) || 'taux_concretisation';
+return `${base} — ${LIBELLES_MODELE_EFB[modele] || LIBELLES_MODELE_EFB.taux_concretisation}`;
+}
+return base;
+}
+
+// Suivis datés envoyés par l'appli (objectifs de Pilotage, étapes et prochain
+// point de Remotivation, engagement / objectif SMART d'Écoute & Feedback).
+// Le client construit la liste, le serveur la nettoie : date ISO obligatoire,
+// libellé tronqué, 20 éléments maximum par entretien.
+function sanitizeSuivis(suivis) {
+if (!Array.isArray(suivis)) return [];
+return suivis
+.map(x => ({ libelle: String((x && x.libelle) || '').trim().slice(0, 300), echeance: String((x && x.echeance) || '').trim() }))
+.filter(x => x.libelle && /^\d{4}-\d{2}-\d{2}$/.test(x.echeance))
+.slice(0, 20);
+}
+
+// Clôture des suivis ouverts d'un magasin (bouton « Fait » du bandeau, ou
+// reprise fait / pas fait au prochain entretien). Le magasin_code est exigé
+// dans le WHERE : un id seul ne permet jamais de clôturer le suivi d'un autre
+// magasin.
+async function cloturerSuivis(env, magasinCode, reprises, par, via, entretienId) {
+const valides = (Array.isArray(reprises) ? reprises : [])
+.filter(r => r && Number.isInteger(Number(r.id)) && ['fait', 'pas_fait'].includes(r.statut))
+.slice(0, 50);
+if (!valides.length || !magasinCode) return 0;
+const stmt = env.DB.prepare(
+`UPDATE suivis_entretien SET statut = ?, cloture_par = ?, cloture_le = datetime('now'), cloture_via = ?, cloture_entretien_id = ?
+WHERE id = ? AND magasin_code = ? AND statut = 'ouvert'`
+);
+await env.DB.batch(valides.map(r => stmt.bind(r.statut, par || null, via, entretienId || null, Number(r.id), String(magasinCode))));
+return valides.length;
+}
+
+// Bilan hebdo (26/09) — objectifs d'entretien dont l'échéance est passée et
+// qui ne sont toujours pas soldés. UNE seule requête pour tout le réseau
+// (limite de sous-requêtes Workers), filtrée ensuite par AR côté code. Le
+// rattachement AR suit magasins.csv du jour (pas l'animateur figé à l'envoi).
+async function getSuivisEnRetard(env, stores) {
+if (!env.DB) return [];
+let rows = [];
+try {
+({ results: rows } = await env.DB.prepare(
+`SELECT magasin_code, magasin_libelle, collaborateur_nom, type_entretien, libelle, echeance
+FROM suivis_entretien WHERE statut = 'ouvert' AND echeance < ? ORDER BY echeance ASC LIMIT 500`
+).bind(parisTodayIso()).all());
+} catch (e) { return []; } // table pas encore créée : section simplement vide
+const parCode = {};
+stores.forEach(s => { parCode[String(s.code)] = s; });
+const today = parisTodayIso();
+const jours = (iso) => Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(iso + 'T00:00:00Z')) / 86400000);
+return rows.map(r => {
+const store = parCode[String(r.magasin_code)];
+return {
+libelleMagasin: store ? store.libelle : (r.magasin_libelle || r.magasin_code),
+animateur: store ? store.animateur : null,
+collaborateur: r.collaborateur_nom || '—',
+type: LIBELLES_ENTRETIEN[r.type_entretien] || r.type_entretien,
+libelle: r.libelle, echeance: r.echeance, retard: jours(r.echeance),
+};
+});
+}
+
+function htmlSuivisEnRetardSection(items, scopeLabel) {
+const title = `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">🔁 Objectifs d'entretien en retard (Suivi Managers)</h3>`;
+if (!items.length) {
+return title + `<p style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#2C2C2A;margin:0 0 16px">Aucun objectif d'entretien en retard ${scopeLabel}. ✅</p>`;
+}
+return title + htmlStatsTable(
+['Magasin', 'Animateur', 'Collaborateur', 'Entretien', 'Objectif', 'Échéance', 'Retard'],
+items.map(i => [i.libelleMagasin, i.animateur || '—', i.collaborateur, i.type, i.libelle, formatDateFr(i.echeance), `${i.retard} j`])
+);
+}
+
 function buildEntretienManagerEmailHtml({ libelleType, magasin, remplipar, date, data, collaborateurNom, hasPdf }) {
 const collabLine = collaborateurNom ? `<p><b>Collaborateur :</b> ${escapeHtml(collaborateurNom)}</p>` : '';
 if (hasPdf) {
@@ -2462,9 +2563,9 @@ return { subject, from, to, byAR, arStats, byArBullets, weeklyRowsCount: weeklyR
 }
 
 // Tableau taux entretiens / lancements par magasin (phase 3, 18/09 — révisé
-// le 18/09 pour exclure Écoute&FB) — recadrage ET écoute_fb exclus du
-// comptage (getEntretiensLancementsMap ne compte que pilotage_optique et
-// pilotage_audio), un magasin sans donnée à 0%.
+// le 18/09 pour exclure Écoute&FB) — types comptés : TYPES_ENTRETIENS_COMPTES
+// (pilotage optique/audio, valorisation, remotivation depuis le 26/09) ;
+// recadrage et écoute_fb exclus, un magasin sans donnée à 0%.
 function htmlEntretiensLancementsTable(stores, map, moisLabel) {
 const rows = stores.map(s => {
 const d = map[s.code] || { tauxLancements: 0, tauxEntretiens: 0, nbVus: 0, nbEligibles: 0 };
@@ -2529,6 +2630,7 @@ const stuckActionsAll = computeStuckActions(stores, lastBilanSnapshots);
 const storeStatsMap = await getStoreStatsMap(env);
 const stuckPedlvAll = await computeStuckPedlvItemsForStores(env, stores, storeStatsMap);
 const entretiensLancementsMap = await getEntretiensLancementsMap(env);
+const suivisEnRetardAll = await getSuivisEnRetard(env, stores);
 const todayISO = new Date().toISOString().slice(0, 10);
 const overdueAll = computeOverdueStores(stores, lastVisitMap, todayISO, lastObservationMap);
 const lastVisitByLibelle = {};
@@ -2561,7 +2663,8 @@ const stuckActionsSection = htmlStuckActionsSection(stuckActionsAll, 'du réseau
 const stuckPedlvSection = htmlStuckPedlvIndicateursSection(stuckPedlvAll, 'du réseau');
 const gaugeSection = htmlEntretiensLancementsGaugeSection(stores.filter(s => s.animateur), entretiensLancementsMap, 'du réseau');
 const checklistSection = htmlChecklistReseauOubliesSection(byAR);
-await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject, bodyHtml: wrapEmailBody(olivierTable + olivierBullets + checklistSection + stuckActionsSection + stuckPedlvSection + unmatchedSection + gaugeSection) });
+const suivisRetardSection = htmlSuivisEnRetardSection(suivisEnRetardAll, 'dans le réseau');
+await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject, bodyHtml: wrapEmailBody(olivierTable + olivierBullets + checklistSection + stuckActionsSection + stuckPedlvSection + suivisRetardSection + unmatchedSection + gaugeSection) });
 await saveWeeklyReport(env, 'bilan_hebdo', 'ALL', from, to, bulletsToText(byArBullets));
 }
 
@@ -2590,8 +2693,9 @@ const arStuckActionsHtml = htmlStuckActionsSection(arStuckActions, 'de votre pé
 const arStuckPedlv = stuckPedlvAll.filter(i => normalizeName(i.animateur) === normalizeName(ar));
 const arStuckPedlvHtml = htmlStuckPedlvIndicateursSection(arStuckPedlv, 'de votre périmètre');
 const arGaugeHtml = htmlEntretiensLancementsGaugeSection(arStores, entretiensLancementsMap, 'de votre périmètre');
+const arSuivisRetardHtml = htmlSuivisEnRetardSection(suivisEnRetardAll.filter(i => normalizeName(i.animateur) === normalizeName(ar)), 'sur votre périmètre');
 try {
-await zimbraSendMail(env, { to: arEmail, subject: `Bilan hebdomadaire — ${ar}`, bodyHtml: wrapEmailBody(arTable + arBulletsHtml + arStuckActionsHtml + arStuckPedlvHtml + arGaugeHtml) });
+await zimbraSendMail(env, { to: arEmail, subject: `Bilan hebdomadaire — ${ar}`, bodyHtml: wrapEmailBody(arTable + arBulletsHtml + arStuckActionsHtml + arStuckPedlvHtml + arSuivisRetardHtml + arGaugeHtml) });
 } catch(e) { console.error('Envoi bilan hebdo échoué pour', ar, e); }
 }
 }
@@ -3273,7 +3377,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -4814,15 +4918,15 @@ if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHead
 if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 try {
 const body = await request.json();
-const { type, magasinCode, collaborateurMatricule, collaborateurNom, remplipar, date, data, pdfBase64, pdfFilename } = body;
-if (!['ecoute_fb', 'pilotage_audio', 'pilotage_optique', 'recadrage'].includes(type)) return jsonError('Type invalide', 400, corsHeaders);
+const { type, magasinCode, collaborateurMatricule, collaborateurNom, remplipar, date, data, pdfBase64, pdfFilename, suivis, reprises } = body;
+if (!TYPES_ENTRETIEN_VALIDES.includes(type)) return jsonError('Type invalide', 400, corsHeaders);
 if (!remplipar || !date) return jsonError('Champs manquants', 400, corsHeaders);
 
 const stores = await getMagasinsServerSide();
 const magasin = stores.find(s => String(s.code) === String(magasinCode)) || null;
 const animateur = magasin ? magasin.animateur : null;
 
-await env.DB.prepare(
+const insert = await env.DB.prepare(
 `INSERT INTO entretiens_manager
 (type, magasin_code, magasin_libelle, animateur, collaborateur_matricule, collaborateur_nom, rempli_par, date, data_json)
 VALUES (?,?,?,?,?,?,?,?,?)`
@@ -4830,11 +4934,31 @@ VALUES (?,?,?,?,?,?,?,?,?)`
 type, magasinCode || null, magasin ? magasin.libelle : null, animateur,
 collaborateurMatricule || null, collaborateurNom || null, remplipar, date, JSON.stringify(data || {})
 ).run();
+const entretienId = insert && insert.meta ? insert.meta.last_row_id : null;
+
+// Suivis datés + reprise des suivis précédents (26/09). Jamais bloquant :
+// l'entretien est déjà enregistré, un souci ici (table suivis_entretien pas
+// encore créée…) ne doit pas faire échouer l'envoi du mail.
+try {
+const propres = sanitizeSuivis(suivis);
+if (propres.length && magasinCode) {
+const stmt = env.DB.prepare(
+`INSERT INTO suivis_entretien
+(entretien_id, magasin_code, magasin_libelle, animateur, collaborateur_matricule, collaborateur_nom, type_entretien, libelle, echeance)
+VALUES (?,?,?,?,?,?,?,?,?)`
+);
+await env.DB.batch(propres.map(x => stmt.bind(
+entretienId, String(magasinCode), magasin ? magasin.libelle : null, animateur,
+collaborateurMatricule || null, collaborateurNom || null, type, x.libelle, x.echeance
+)));
+}
+await cloturerSuivis(env, magasinCode, reprises, remplipar, 'entretien', entretienId);
+} catch (e) { console.error('Suivis entretien non enregistrés:', e); }
 
 if (magasin && magasin.email) {
-const libelles = { ecoute_fb: 'Écoute & Feedback de vente', pilotage_audio: 'Pilotage Audio', pilotage_optique: 'Pilotage Optique', recadrage: 'Entretien de recadrage' };
-const subject = `Entretien manager — ${libelles[type]} — ${magasin.libelle} — ${formatDateFr(date)}`;
-const bodyHtml = buildEntretienManagerEmailHtml({ libelleType: libelles[type], magasin, remplipar, date, data, collaborateurNom, hasPdf: !!pdfBase64 });
+const libelleType = libelleEntretien(type, data);
+const subject = `Entretien manager — ${libelleType} — ${magasin.libelle} — ${formatDateFr(date)}`;
+const bodyHtml = buildEntretienManagerEmailHtml({ libelleType, magasin, remplipar, date, data, collaborateurNom, hasPdf: !!pdfBase64 });
 try {
 if (pdfBase64) {
 await zimbraSendMailWithAttachment(env, { to: magasin.email, subject, bodyHtml, pdfBase64, filename: pdfFilename });
@@ -4844,9 +4968,69 @@ await zimbraSendMail(env, { to: magasin.email, subject, bodyHtml });
 } catch (e) { console.error('Échec envoi mail entretien manager:', e); }
 }
 
-return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+return new Response(JSON.stringify({ ok: true, id: entretienId }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur enregistrement entretien : ' + String(e), 500, corsHeaders);
+}
+}
+
+// Bandeau « À suivre » (26/09) — suivis ouverts d'un magasin : en retard ou
+// arrivant à échéance dans les 7 prochains jours.
+if (url.pathname === '/suivis-magasin') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const magasinCode = url.searchParams.get('magasin_code');
+if (!magasinCode) return jsonError('magasin_code manquant', 400, corsHeaders);
+try {
+const today = parisTodayIso();
+const limite = addDaysIso(today, 7);
+const { results } = await env.DB.prepare(
+`SELECT id, collaborateur_matricule, collaborateur_nom, type_entretien, libelle, echeance
+FROM suivis_entretien WHERE magasin_code = ? AND statut = 'ouvert' AND echeance <= ?
+ORDER BY echeance ASC, id ASC LIMIT 100`
+).bind(String(magasinCode), limite).all();
+return new Response(JSON.stringify({ ok: true, today, suivis: results }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+// Table pas encore créée : bandeau vide plutôt qu'une erreur à l'écran.
+return new Response(JSON.stringify({ ok: true, today: parisTodayIso(), suivis: [], warning: String(e) }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+}
+
+// Reprise au prochain entretien (26/09) — tous les suivis encore ouverts d'un
+// collaborateur pour un même type d'entretien (toutes échéances confondues).
+if (url.pathname === '/suivis-collaborateur') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const magasinCode = url.searchParams.get('magasin_code');
+const matricule = url.searchParams.get('matricule');
+const type = url.searchParams.get('type');
+if (!magasinCode || !matricule || !type) return jsonError('Paramètres manquants', 400, corsHeaders);
+try {
+const { results } = await env.DB.prepare(
+`SELECT id, libelle, echeance, created_at FROM suivis_entretien
+WHERE magasin_code = ? AND collaborateur_matricule = ? AND type_entretien = ? AND statut = 'ouvert'
+ORDER BY echeance ASC, id ASC LIMIT 50`
+).bind(String(magasinCode), String(matricule), String(type)).all();
+return new Response(JSON.stringify({ ok: true, suivis: results }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return new Response(JSON.stringify({ ok: true, suivis: [], warning: String(e) }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+}
+
+// Bouton « Fait » du bandeau (26/09) — horodaté et signé du prénom saisi.
+if (url.pathname === '/suivi-cloture') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+const { id, magasinCode, par } = await request.json();
+if (!id || !magasinCode || !par) return jsonError('Champs manquants', 400, corsHeaders);
+await cloturerSuivis(env, magasinCode, [{ id, statut: 'fait' }], String(par).slice(0, 80), 'bandeau', null);
+return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur clôture suivi : ' + String(e), 500, corsHeaders);
 }
 }
 
@@ -5032,9 +5216,20 @@ const stores = await getMagasinsServerSide();
 const store = stores.find(s => String(s.code) === String(magasinCode));
 if (!store) return new Response(JSON.stringify({ ok: true, periode: null }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
+// Positionnement annuel (26/09, trame de Valorisation) : ratio magasin repris
+// du DERNIER bilan de passage (colonne ca_annuel, même source que la fiche
+// magasin) — requête ciblée sur ce seul magasin, jamais bloquante.
+let positionnementAnnuel = null, positionnementAnnuelDate = null;
+try {
+const b = await env.DB.prepare(
+`SELECT date, ca_annuel FROM bilans WHERE magasin_code = ? AND ca_annuel IS NOT NULL AND ca_annuel != '' ORDER BY date DESC, id DESC LIMIT 1`
+).bind(String(store.code)).first();
+if (b) { positionnementAnnuel = toNumOrNull(b.ca_annuel); positionnementAnnuelDate = b.date || null; }
+} catch (e) {}
+
 const statsMap = await getStoreStatsMap(env);
 const row = statsMap[normalizeName(store.libelle)];
-if (!row) return new Response(JSON.stringify({ ok: true, periode: null }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+if (!row) return new Response(JSON.stringify({ ok: true, periode: null, positionnementAnnuel, positionnementAnnuelDate }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 const caTotal = row.ca_total != null ? Number(row.ca_total) : null;
 const caAudio = row.ca_audio != null ? Number(row.ca_audio) : null;
@@ -5056,7 +5251,7 @@ ok: true, periode: row.periode || null,
 caTotal: toEurosRounded(caTotal), caAudio: toEurosRounded(caAudio), caOpt: toEurosRounded(row.ca_opt != null ? Number(row.ca_opt) : null),
 nbVenteOpt: row.nb_vente_opt != null ? Number(row.nb_vente_opt) : null,
 protheses: row.protheses_vendues != null ? Number(row.protheses_vendues) : null,
-positionnementMensuel, caAudioMagPct,
+positionnementMensuel, caAudioMagPct, positionnementAnnuel, positionnementAnnuelDate,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture stats mensuelles magasin : ' + String(e), 500, corsHeaders);
