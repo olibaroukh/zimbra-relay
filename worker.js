@@ -241,6 +241,10 @@ const idxPresentoirVerres = header.indexOf('presentoir_verres');
 const idxEffTheo = header.indexOf('eff_theo');
 const idxManager = header.indexOf('manager');
 const idxObjectifAnnuel = header.indexOf('Objectif Annuel');
+// alsace_moselle (26/09) : "oui" pour les magasins du 57/67/68 — ajoute le
+// Vendredi saint et le 26 décembre aux fériés déduits des jours attendus de
+// lancement de journée. Vide/"non" = hors Alsace-Moselle.
+const idxAlsaceMoselle = header.indexOf('alsace_moselle');
 const rows = lines.slice(1).map(line => {
 const cols = line.split(';');
 const effTheoRaw = idxEffTheo >= 0 ? (cols[idxEffTheo] || '').trim() : '';
@@ -257,6 +261,7 @@ googlePlaceId: idxPlaceId >= 0 ? (cols[idxPlaceId] || '').trim() : '',
 concept: idxConcept >= 0 ? (cols[idxConcept] || '').trim() : '',
 meubleVitrine: idxMeubleVitrine >= 0 ? /^(oui|1|true)$/i.test((cols[idxMeubleVitrine] || '').trim()) : false,
 presentoirVerres: idxPresentoirVerres >= 0 ? /^(oui|1|true)$/i.test((cols[idxPresentoirVerres] || '').trim()) : false,
+alsaceMoselle: idxAlsaceMoselle >= 0 ? /^(oui|1|true)$/i.test((cols[idxAlsaceMoselle] || '').trim()) : false,
 effTheo: Number.isFinite(effTheoNum) ? effTheoNum : null,
 manager: idxManager >= 0 ? (cols[idxManager] || '').trim() : '',
 // En k€, saisi une fois par an par Olivier — sert de base au calcul du CA
@@ -1676,6 +1681,89 @@ items.map(i => [i.libelle, i.animateur, i.text, i.repriseCount + 1])
 );
 }
 
+// ── Calendrier réseau des jours ouvrés (26/09) ──
+// Dénominateur unique du taux de lancement de journée, identique pour tous
+// les magasins (décision d'Olivier : équité, plus de déclaratif PEDLV) :
+// jours du mois − dimanches − fériés fermés − fermetures réseau (Kippour…).
+// Fériés fermés : tous les fériés légaux SAUF le lundi de Pentecôte (journée
+// de solidarité, magasins ouverts). Alsace-Moselle (colonne alsace_moselle de
+// magasins.csv) : + Vendredi saint et 26 décembre. Fermetures réseau : table
+// D1 fermetures_reseau, saisie par Olivier dans bilan-passage/import.html
+// (intitulé, date de début, nombre de jours). Un férié tombant un dimanche
+// n'est jamais déduit deux fois (boucle jour par jour).
+function isoDateUTC(y, m0, d) { return new Date(Date.UTC(y, m0, d)).toISOString().slice(0, 10); }
+function addDaysIso(iso, n) {
+const [y, m, d] = iso.split('-').map(Number);
+return isoDateUTC(y, m - 1, d + n);
+}
+function dimanchePaques(y) {
+// Algorithme de Meeus/Jones/Butcher (calendrier grégorien)
+const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3);
+const h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4;
+const l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+const mois = Math.floor((h + l - 7 * m + 114) / 31), jour = ((h + l - 7 * m + 114) % 31) + 1;
+return isoDateUTC(y, mois - 1, jour);
+}
+function feriesFermesSet(y, alsaceMoselle) {
+const paques = dimanchePaques(y);
+const set = new Set([
+`${y}-01-01`, addDaysIso(paques, 1), `${y}-05-01`, `${y}-05-08`, addDaysIso(paques, 39),
+`${y}-07-14`, `${y}-08-15`, `${y}-11-01`, `${y}-11-11`, `${y}-12-25`,
+]);
+if (alsaceMoselle) { set.add(addDaysIso(paques, -2)); set.add(`${y}-12-26`); }
+return set;
+}
+function parisTodayIso() {
+return new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' });
+}
+async function getFermeturesReseau(env) {
+if (!env.DB) return [];
+try {
+const { results } = await env.DB.prepare(
+`SELECT id, intitule, date_debut, nb_jours FROM fermetures_reseau ORDER BY date_debut`
+).all();
+return results || [];
+} catch (e) { return []; }
+}
+function fermeturesReseauSet(fermetures) {
+const set = new Set();
+(fermetures || []).forEach(f => {
+const n = Math.max(1, parseInt(f.nb_jours, 10) || 1);
+for (let i = 0; i < n; i++) set.add(addDaysIso(f.date_debut, i));
+});
+return set;
+}
+// Nombre de jours attendus dans le mois `mois` (YYYY-MM), éventuellement
+// arrêté à `jusquAuIso` inclus (jours écoulés).
+function compterJoursAttendus(mois, alsaceMoselle, fermSet, jusquAuIso) {
+const [y, m] = mois.split('-').map(Number);
+const feries = feriesFermesSet(y, alsaceMoselle);
+const nbJours = new Date(Date.UTC(y, m, 0)).getUTCDate();
+let n = 0;
+for (let d = 1; d <= nbJours; d++) {
+const iso = isoDateUTC(y, m - 1, d);
+if (jusquAuIso && iso > jusquAuIso) break;
+if (new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 0) continue;
+if (feries.has(iso) || fermSet.has(iso)) continue;
+n++;
+}
+return n;
+}
+// Jours attendus pour le taux de lancement. Mois en cours : jours écoulés
+// jusqu'à HIER inclus (le lancement du jour n'est peut-être pas encore fait
+// au moment du calcul — ex. bilan hebdo du samedi 8h), avec repli sur
+// aujourd'hui si aucun jour n'est encore écoulé (1er du mois). Les lancements
+// d'aujourd'hui comptent quand même au numérateur ; taux plafonné à 100 %.
+// Mois passé : mois complet.
+function joursAttendusLancement(mois, alsaceMoselle, fermSet) {
+const today = parisTodayIso();
+const moisCourant = today.slice(0, 7);
+if (mois !== moisCourant) return compterJoursAttendus(mois, alsaceMoselle, fermSet);
+const hier = compterJoursAttendus(mois, alsaceMoselle, fermSet, addDaysIso(today, -1));
+return hier > 0 ? hier : compterJoursAttendus(mois, alsaceMoselle, fermSet, today);
+}
+
 // Suivi Managers → score de santé, phase 3 (18/09) — deux nouveaux signaux :
 // couverture des entretiens individuels et cadence des lancements de journée.
 // Contrairement à toutes les autres dimensions (exclues du score si pas de
@@ -1684,13 +1772,13 @@ items.map(i => [i.libelle, i.animateur, i.text, i.repriseCount + 1])
 // règle reste propre à ces deux dimensions pour l'instant ; les autres
 // basculeront sur le même principe en janvier 2027 (décision actée, pas
 // encore appliquée).
-// Limite connue : les jours d'ouverture magasin (dénominateur du taux de
-// lancement) viennent du dernier mois RH connu pour ce site, faute de
-// connaître déjà les fermetures/fériés du mois en cours — l'agenda RH n'est
-// importé que le mois suivant. Utilisé comme meilleure estimation disponible.
-async function getEntretiensLancementsMap(env) {
+// Dénominateur du taux de lancement (26/09) : calendrier réseau commun
+// (voir joursAttendusLancement), plus le déclaratif PEDLV ni l'estimation RH.
+// `moisCible` (YYYY-MM) optionnel : utilisé par le bilan mensuel du 1er pour
+// calculer le mois écoulé (sans lui, le 1er renvoyait le mois qui commence).
+async function getEntretiensLancementsMap(env, moisCible) {
 if (!env.DB) return {};
-const moisActuel = new Date().toISOString().slice(0, 7);
+const moisActuel = moisCible || parisTodayIso().slice(0, 7);
 
 let eligibleRows = [];
 try {
@@ -1724,39 +1812,16 @@ entretienRows.forEach(r => {
 (vusParMagasin[r.magasin_code] = vusParMagasin[r.magasin_code] || new Set()).add(r.collaborateur_matricule);
 });
 
-// Jours d'ouverture du magasin (18/09) — source principale : le champ
-// "jours ouvrés du mois" déjà saisi dans Pour être dans le vert (lun-ven du
-// mois, modifiable), capté dans store_stats.jours_ouvres_mois à chaque
-// génération de rapport. Repli sur l'estimation RH (dernier mois connu,
-// jours_calendaires - fériés - fermetures) uniquement si PEDLV n'a encore
-// rien remonté pour ce magasin.
+// Jours attendus par magasin (26/09) — calendrier réseau commun, seule
+// différence possible entre magasins : l'Alsace-Moselle (2 fériés de plus).
 const stores = await getMagasinsServerSide();
-const storeStatsMap = await getStoreStatsMap(env);
-const joursOuvertsPedlvParMagasin = {};
+const fermSet = fermeturesReseauSet(await getFermeturesReseau(env));
+const joursAttendusStd = joursAttendusLancement(moisActuel, false, fermSet);
+const joursAttendusAM = joursAttendusLancement(moisActuel, true, fermSet);
+const joursOuvertsParMagasin = {};
 stores.forEach(store => {
-const row = storeStatsMap[normalizeName(store.libelle)];
-if (row && row.jours_ouvres_mois != null) joursOuvertsPedlvParMagasin[store.code] = Math.round(row.jours_ouvres_mois);
+if (store.code) joursOuvertsParMagasin[store.code] = store.alsaceMoselle ? joursAttendusAM : joursAttendusStd;
 });
-
-let joursRows = [];
-try {
-({ results: joursRows } = await env.DB.prepare(
-`SELECT es.code_site, AVG(a.jours_calendaires) as cal, AVG(a.jours_feries) as feries, AVG(a.jours_fermeture_magasin) as fermeture
-FROM rh_agenda_mensuel a
-JOIN rh_effectif_site_mensuel es ON es.mois = a.mois AND es.matricule = a.matricule
-INNER JOIN (
-SELECT code_site, MAX(mois) as maxmois FROM rh_effectif_site_mensuel WHERE site_reconnu = 1 GROUP BY code_site
-) latest ON latest.code_site = es.code_site AND latest.maxmois = es.mois
-WHERE es.site_reconnu = 1
-GROUP BY es.code_site`
-).all());
-} catch (e) {}
-const joursOuvertsRhParMagasin = {};
-joursRows.forEach(r => {
-const j = Math.round((r.cal || 0) - (r.feries || 0) - (r.fermeture || 0));
-joursOuvertsRhParMagasin[r.code_site] = j > 0 ? j : null;
-});
-const joursOuvertsParMagasin = { ...joursOuvertsRhParMagasin, ...joursOuvertsPedlvParMagasin };
 
 let lancementRows = [];
 try {
@@ -2379,26 +2444,30 @@ return { subject, from, to, byAR, arStats, byArBullets, weeklyRowsCount: weeklyR
 // le 18/09 pour exclure Écoute&FB) — recadrage ET écoute_fb exclus du
 // comptage (getEntretiensLancementsMap ne compte que pilotage_optique et
 // pilotage_audio), un magasin sans donnée à 0%.
-function htmlEntretiensLancementsTable(stores, map) {
+function htmlEntretiensLancementsTable(stores, map, moisLabel) {
 const rows = stores.map(s => {
 const d = map[s.code] || { tauxLancements: 0, tauxEntretiens: 0, nbVus: 0, nbEligibles: 0 };
 return [s.libelle, `${d.tauxLancements}%`, `${d.tauxEntretiens}% (${d.nbVus}/${d.nbEligibles})`];
 });
-return `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">Suivi Managers — taux du mois</h3>` +
+return `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">Suivi Managers — taux ${moisLabel ? 'de ' + moisLabel : 'du mois'}</h3>` +
 htmlStatsTable(['Magasin', 'Lancements de journée', 'Entretiens individuels'], rows);
 }
 
 async function sendMonthlyReport(env, override) {
 const { subject, arStats, byArBullets } = await generateMonthlyReport(env, override);
 const stores = await getMagasinsServerSide();
-const entretiensLancementsMap = await getEntretiensLancementsMap(env);
+// 26/09 : le bilan mensuel part le 1er — on calcule le mois écoulé (même
+// plage que generateMonthlyReport), pas le mois qui commence.
+const moisBilan = (override || mostRecentMonthRange()).from.slice(0, 7);
+const moisBilanLabel = moisLabelKaizen(moisBilan);
+const entretiensLancementsMap = await getEntretiensLancementsMap(env, moisBilan);
 
 const olivierTable = htmlStatsTable(
 ['Animateur', 'Magasins visités', 'Bilans', 'Humeur moy. /4', 'Durée moy.'],
 arStats.map(s => [s.label, s.nbMagasins, s.nbBilans, formatHumeur(s.avgHumeur), formatDuree(s.avgDuree)])
 );
 const olivierBullets = htmlBulletSections(byArBullets);
-const olivierSuiviManagers = htmlEntretiensLancementsTable(stores.filter(s => s.animateur), entretiensLancementsMap);
+const olivierSuiviManagers = htmlEntretiensLancementsTable(stores.filter(s => s.animateur), entretiensLancementsMap, moisBilanLabel);
 await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject, bodyHtml: wrapEmailBody(olivierTable + olivierBullets + olivierSuiviManagers) });
 
 for (const [ar, bullets] of Object.entries(byArBullets)) {
@@ -2407,7 +2476,7 @@ const arEmail = getArEmail(stores, ar);
 if (!arEmail) continue;
 const arBulletsHtml = htmlBulletSections({ [ar]: bullets });
 const arStoresList = stores.filter(s => s.animateur === ar);
-const arSuiviManagers = htmlEntretiensLancementsTable(arStoresList, entretiensLancementsMap);
+const arSuiviManagers = htmlEntretiensLancementsTable(arStoresList, entretiensLancementsMap, moisBilanLabel);
 try {
 await zimbraSendMail(env, { to: arEmail, subject: `Bilan mensuel — ${ar}`, bodyHtml: wrapEmailBody(arBulletsHtml + arSuiviManagers) });
 } catch(e) { console.error('Envoi bilan mensuel échoué pour', ar, e); }
@@ -2419,7 +2488,7 @@ await zimbraSendMail(env, { to: arEmail, subject: `Bilan mensuel — ${ar}`, bod
 // la clôture plutôt que de le découvrir a posteriori dans le récap mensuel.
 function htmlEntretiensLancementsGaugeSection(stores, map, scopeLabel) {
 if (!stores.length) return '';
-const moisActuelLabel = moisLabelKaizen(new Date().toISOString().slice(0, 7));
+const moisActuelLabel = moisLabelKaizen(parisTodayIso().slice(0, 7));
 const title = `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:16px 0 6px;border-bottom:1px solid #CC1719;padding-bottom:3px">📋 Entretiens & lancements — ${moisActuelLabel} (en cours)</h3>`;
 const rows = stores.map(s => {
 const d = map[s.code] || { nbVus: 0, nbEligibles: 0, joursLances: 0, joursOuverts: 0 };
@@ -5932,6 +6001,66 @@ rejected,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur import historique Kaizen : ' + String(e), 500, corsHeaders);
+}
+}
+
+// ── Jours attendus (26/09) — préremplissage du champ "jours ouvrés" de PEDLV
+// avec le calendrier réseau. GET ?mois=YYYY-MM&date=YYYY-MM-DD&code=XXXX
+// (date = date d'extraction → jours écoulés ; code → règle Alsace-Moselle).
+if (url.pathname === '/jours-ouvres' && request.method === 'GET') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+const mois = url.searchParams.get('mois') || '';
+if (!/^\d{4}-\d{2}$/.test(mois)) return jsonError('Paramètre mois invalide (YYYY-MM)', 400, corsHeaders);
+const date = url.searchParams.get('date') || '';
+const code = (url.searchParams.get('code') || '').trim();
+let alsaceMoselle = false;
+if (code) {
+const stores = await getMagasinsServerSide();
+const st = stores.find(s => s.code === code || s.code.replace(/^0+/, '') === code.replace(/^0+/, ''));
+alsaceMoselle = !!(st && st.alsaceMoselle);
+}
+const fermSet = fermeturesReseauSet(await getFermeturesReseau(env));
+const joursMois = compterJoursAttendus(mois, alsaceMoselle, fermSet);
+const joursEcoules = /^\d{4}-\d{2}-\d{2}$/.test(date) && date.startsWith(mois)
+? compterJoursAttendus(mois, alsaceMoselle, fermSet, date) : null;
+return new Response(JSON.stringify({ ok: true, mois, joursMois, joursEcoules, alsaceMoselle }), {
+status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+}
+
+// ── Fermetures réseau (26/09) — Kippour ou toute autre fermeture de tous les
+// magasins, gérées par Olivier depuis bilan-passage/import.html.
+// GET liste · POST {intitule, date_debut, nb_jours} ajout · POST {deleteId} suppression.
+if (url.pathname === '/fermetures-reseau') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (sessionAr !== 'ALL') return jsonError('Réservé à Olivier', 403, corsHeaders);
+try {
+if (request.method === 'POST') {
+const body = await request.json();
+if (body.deleteId != null) {
+await env.DB.prepare(`DELETE FROM fermetures_reseau WHERE id = ?`).bind(parseInt(body.deleteId, 10)).run();
+} else {
+const intitule = String(body.intitule || '').trim().slice(0, 120);
+const dateDebut = String(body.date_debut || '').trim();
+const nbJours = parseInt(body.nb_jours, 10);
+if (!intitule) return jsonError('Intitulé requis', 400, corsHeaders);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(dateDebut)) return jsonError('Date de début invalide', 400, corsHeaders);
+if (!(nbJours >= 1 && nbJours <= 31)) return jsonError('Nombre de jours invalide (1 à 31)', 400, corsHeaders);
+await env.DB.prepare(
+`INSERT INTO fermetures_reseau (intitule, date_debut, nb_jours, created_at) VALUES (?, ?, ?, ?)`
+).bind(intitule, dateDebut, nbJours, new Date().toISOString()).run();
+}
+}
+const fermetures = await getFermeturesReseau(env);
+return new Response(JSON.stringify({ ok: true, fermetures }), {
+status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+} catch (e) {
+return jsonError('Erreur fermetures réseau : ' + String(e), 500, corsHeaders);
 }
 }
 
