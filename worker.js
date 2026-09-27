@@ -4197,6 +4197,31 @@ const caPrevisionnelAnnuel = (store.objectifAnnuel !== null && base.positionneme
 ? Math.round(store.objectifAnnuel * base.positionnementAnnuel) / 100
 : null;
 
+// --- Suivi manager (27/09) : actions / objectifs datés posés en entretien
+// (table suivis_entretien, Suivi Managers v2). Tous les suivis encore ouverts,
+// quelle que soit l'échéance (le bandeau de Suivi Managers ne montre que
+// retard + 7 jours), plus les suivis clôturés ces 30 derniers jours pour voir
+// ce qui a été fait / pas fait. Une seule requête ; table absente -> liste vide.
+let suivisManager = { today: parisTodayIso(), ouverts: [], clotures: [] };
+try {
+const { results: svRows } = await env.DB.prepare(
+`SELECT s.id, s.collaborateur_nom, s.type_entretien, s.libelle, s.echeance, s.statut,
+s.created_at, s.cloture_par, s.cloture_le, e.rempli_par, e.date AS entretien_date
+FROM suivis_entretien s LEFT JOIN entretiens_manager e ON e.id = s.entretien_id
+WHERE s.magasin_code = ? AND (s.statut = 'ouvert' OR s.cloture_le >= datetime('now', '-30 days'))
+ORDER BY s.echeance ASC, s.id ASC LIMIT 150`
+).bind(code).all();
+svRows.forEach(r => {
+const item = {
+id: r.id, collaborateur: r.collaborateur_nom || null, type: r.type_entretien, libelle: r.libelle,
+echeance: r.echeance, posePar: r.rempli_par || null, poseLe: r.entretien_date || (r.created_at ? String(r.created_at).slice(0, 10) : null),
+};
+if (r.statut === 'ouvert') suivisManager.ouverts.push(item);
+else suivisManager.clotures.push({ ...item, statut: r.statut, cloturePar: r.cloture_par || null, clotureLe: r.cloture_le ? String(r.cloture_le).slice(0, 10) : null });
+});
+suivisManager.clotures.sort((a, b) => String(b.clotureLe || '').localeCompare(String(a.clotureLe || '')));
+} catch(e) { console.error('Suivis manager (détail magasin):', e); }
+
 return new Response(JSON.stringify({
 ok: true,
 magasin: { code: store.code, libelle: store.libelle, animateur: store.animateur, concept: store.concept },
@@ -4210,6 +4235,7 @@ kaizenPointsNonResolus,
 equipeTaches,
 manager,
 checklistReseauPassages,
+suivisManager,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur détail magasin : ' + String(e), 500, corsHeaders);
