@@ -1957,6 +1957,10 @@ text: a.text,
 repriseCount: a._repriseCount || 0,
 fromPrevious: !!a._fromPrevious,
 status: a._status || null,
+// 27/09 : échéance et responsable, pour signaler dans le dashboard les
+// actions du dernier bilan dont la date est dépassée (sans effet sur le score).
+date: /^\d{4}-\d{2}-\d{2}/.test(a.date || '') ? String(a.date).slice(0, 10) : null,
+who: a.who || null,
 })),
 } : null,
 pedlv: computePedlvSummary(storeStatsMap[normalizeName(store.libelle)]),
