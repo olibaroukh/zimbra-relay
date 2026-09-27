@@ -4222,6 +4222,30 @@ else suivisManager.clotures.push({ ...item, statut: r.statut, cloturePar: r.clot
 suivisManager.clotures.sort((a, b) => String(b.clotureLe || '').localeCompare(String(a.clotureLe || '')));
 } catch(e) { console.error('Suivis manager (détail magasin):', e); }
 
+// --- Accompagnement Manager (27/09) : plan d'action de la dernière visite
+// d'accompagnement du magasin (brouillon ou finalisée — la plus récente, comme
+// la relance à 90 jours qui ne considère que la dernière visite).
+let accompagnement = null;
+try {
+const acc = await env.DB.prepare(
+`SELECT id, date_visite, statut, itinerant, manager, contenu_json FROM accompagnements
+WHERE magasin_code = ? ORDER BY date_visite DESC, updated_at DESC LIMIT 1`
+).bind(code).first();
+if (acc) {
+let contenu = {};
+try { contenu = JSON.parse(acc.contenu_json || '{}'); } catch (e) {}
+const actions = ((contenu.plan && contenu.plan.actions) || [])
+.filter(a => a && String(a.action || '').trim())
+.slice(0, 60)
+.map(a => ({
+action: String(a.action), responsable: a.responsable || null,
+echeance: /^\d{4}-\d{2}-\d{2}/.test(a.echeance || '') ? String(a.echeance).slice(0, 10) : null,
+statut: a.statut || 'A faire', origine: a.origine || null,
+}));
+accompagnement = { id: acc.id, dateVisite: acc.date_visite, statut: acc.statut, itinerant: acc.itinerant || null, manager: acc.manager || null, actions };
+}
+} catch(e) { console.error('Accompagnement (détail magasin):', e); }
+
 return new Response(JSON.stringify({
 ok: true,
 magasin: { code: store.code, libelle: store.libelle, animateur: store.animateur, concept: store.concept },
@@ -4236,6 +4260,7 @@ equipeTaches,
 manager,
 checklistReseauPassages,
 suivisManager,
+accompagnement,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur détail magasin : ' + String(e), 500, corsHeaders);
