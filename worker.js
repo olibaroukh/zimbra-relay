@@ -5137,6 +5137,40 @@ return jsonError('Erreur enregistrement lancement : ' + String(e), 500, corsHead
 }
 }
 
+// Suppression d'un entretien ou d'un lancement de journée depuis l'Historique
+// de Suivi Managers (29/09) — réservée à Olivier (session AR 'ALL'), pour
+// retirer les doublons. Supprimer un entretien supprime aussi les suivis datés
+// qu'il avait créés (sinon ils resteraient en alerte « À suivre »). Les suivis
+// qu'il avait clôturés restent clôturés.
+if (url.pathname === '/historique-managers-supprimer') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+if (sessionAr !== 'ALL') return jsonError('Suppression réservée à Olivier', 403, corsHeaders);
+try {
+const { kind, id } = await request.json();
+const n = Number(id);
+if (!Number.isInteger(n) || n <= 0 || !['entretien', 'lancement'].includes(kind)) return jsonError('Paramètres invalides', 400, corsHeaders);
+let suivisSupprimes = 0;
+if (kind === 'entretien') {
+try {
+const r = await env.DB.prepare(`DELETE FROM suivis_entretien WHERE entretien_id = ?`).bind(n).run();
+suivisSupprimes = (r && r.meta && r.meta.changes) || 0;
+} catch (e) { /* table absente : rien à supprimer */ }
+const del = await env.DB.prepare(`DELETE FROM entretiens_manager WHERE id = ?`).bind(n).run();
+if (!(del && del.meta && del.meta.changes)) return jsonError('Entretien introuvable', 404, corsHeaders);
+} else {
+const del = await env.DB.prepare(`DELETE FROM lancements_journee WHERE id = ?`).bind(n).run();
+if (!(del && del.meta && del.meta.changes)) return jsonError('Lancement introuvable', 404, corsHeaders);
+}
+return new Response(JSON.stringify({ ok: true, suivisSupprimes }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur suppression : ' + String(e), 500, corsHeaders);
+}
+}
+
 if (url.pathname === '/historique-managers') {
 const storeToken = request.headers.get('X-Store-Token');
 if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
