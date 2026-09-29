@@ -1002,14 +1002,18 @@ try { await env.DB.prepare('DELETE FROM observations').run(); } catch(e) { conso
 try { await env.DB.prepare('DELETE FROM store_stats').run(); } catch(e) { console.error('Purge store_stats échouée:', e); }
 }
 
+// 29/09 : semaine du lundi au SAMEDI (avant : lundi-vendredi, les bilans du
+// samedi n'étaient jamais repris). Le bilan hebdo part désormais le dimanche
+// matin : la semaine retenue va du lundi à la veille (samedi). Appelé un autre
+// jour (routes de test), on prend la dernière semaine lundi-samedi complète.
 function mostRecentWeekRange() {
 const now = new Date();
 const day = now.getUTCDay();
-const diffToFriday = ((day - 5) + 7) % 7 || 7;
-const friday = new Date(now); friday.setUTCDate(now.getUTCDate() - diffToFriday);
-const monday = new Date(friday); monday.setUTCDate(friday.getUTCDate() - 4);
+const diffToSaturday = ((day - 6) + 7) % 7 || 7;
+const saturday = new Date(now); saturday.setUTCDate(now.getUTCDate() - diffToSaturday);
+const monday = new Date(saturday); monday.setUTCDate(saturday.getUTCDate() - 5);
 const fmt = d => d.toISOString().slice(0, 10);
-return { from: fmt(monday), to: fmt(friday) };
+return { from: fmt(monday), to: fmt(saturday) };
 }
 
 async function getWeekData(env, override) {
@@ -1550,7 +1554,7 @@ const HEALTH_DRIFT_LOOKBACK_WEEKS = 4;
 
 // Historique + écriture en requêtes groupées (une seule requête pour tous les
 // magasins, pas une par magasin) pour rester loin de la limite de
-// sous-requêtes du plan gratuit Workers — ce même cron (SAT) envoie déjà le
+// sous-requêtes du plan gratuit Workers — ce même cron (dimanche 6h UTC) envoie déjà le
 // rapport hebdomadaire et la relance visite dans la même invocation.
 async function getHealthScoreHistoryMap(env, currentPeriodKey) {
 if (!env.DB) return {};
@@ -1773,7 +1777,7 @@ return n;
 }
 // Jours attendus pour le taux de lancement. Mois en cours : jours écoulés
 // jusqu'à HIER inclus (le lancement du jour n'est peut-être pas encore fait
-// au moment du calcul — ex. bilan hebdo du samedi 8h), avec repli sur
+// au moment du calcul — ex. bilan hebdo du dimanche 8h), avec repli sur
 // aujourd'hui si aucun jour n'est encore écoulé (1er du mois). Les lancements
 // d'aujourd'hui comptent quand même au numérateur ; taux plafonné à 100 %.
 // Mois passé : mois complet.
@@ -3046,7 +3050,7 @@ const subjectPrefix = `Com hebdo (brouillon) — semaine du ${from.split('-').re
 
 if (!arFilter) {
 // Note (23/08) : pas de section "Noms non reconnus (Pour être dans le vert)" ici —
-// déjà présente dans le bilan hebdomadaire du samedi (sendWeeklyReport), doublon
+// déjà présente dans le bilan hebdomadaire du dimanche matin (sendWeeklyReport), doublon
 // jugé inutile par Olivier.
 let networkBody = formatComHebdoAsEmail(blocks);
 await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject: subjectPrefix + ' — réseau complet', bodyText: networkBody });
@@ -6483,7 +6487,9 @@ if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
 ctx.waitUntil(withCronAlert(env, 'Com hebdo', () => sendComHebdo(env)));
 } else if (cron === '0 20 * * SUN' || cron === '0 22 * * SUN') {
 ctx.waitUntil(withCronAlert(env, 'Purge hebdomadaire', () => purgeWeeklySources(env)));
-} else if (cron === '0 6 * * SAT') {
+} else if (cron === '0 6 * * SUN') {
+// 29/09 : décalé du samedi au dimanche (beaucoup de magasins utilisent les
+// outils le samedi). Trigger Cloudflare à passer de "0 6 * * SAT" à "0 6 * * SUN".
 ctx.waitUntil(withCronAlert(env, 'Bilan hebdomadaire', () => sendWeeklyReport(env)));
 ctx.waitUntil(withCronAlert(env, 'Relance visite', () => sendVisitReminders(env)));
 } else if (cron === '0 8 1 * *') {
