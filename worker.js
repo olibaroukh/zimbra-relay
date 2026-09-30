@@ -4770,7 +4770,16 @@ if (url.pathname === '/rh-import/effectif') {
       const nomsSitesRaw = String(row['Noms sites'] ?? '').trim();
       const codesSites = codesSitesRaw ? codesSitesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
       const nomsSites = nomsSitesRaw ? nomsSitesRaw.split(',').map(s => s.trim()) : [];
-      const nbSites = codesSites.length;
+      // Dédoublonnage APRÈS mapping : l'export RH peut répéter un site dans la même cellule
+      // (ex: "163002,163002,163001" ou "137002_F0125,137002_F0125,137002" → tous "137002"),
+      // ce qui violait la PK (mois, matricule, code_site).
+      const sitesUniques = new Map();
+      codesSites.forEach((codeRh, i) => {
+        const { code, reconnu } = rhMapCodeSiteVersMagasin(codeRh, magasinsCodes);
+        const codeFinal = code || codeRh;
+        if (!sitesUniques.has(codeFinal)) sitesUniques.set(codeFinal, { reconnu, nom: nomsSites[i] || '' });
+      });
+      const nbSites = sitesUniques.size;
       if (!nbSites) nbSansSite++;
 
       stmts.push(env.DB.prepare(
@@ -4792,10 +4801,8 @@ if (url.pathname === '/rh-import/effectif') {
       // Idempotent : on repart de zéro sur la répartition par site de ce salarié pour ce mois avant réinsertion.
       stmts.push(env.DB.prepare(`DELETE FROM rh_effectif_site_mensuel WHERE mois = ? AND matricule = ?`).bind(mois, matricule));
 
-      codesSites.forEach((codeRh, i) => {
-        const { code, reconnu } = rhMapCodeSiteVersMagasin(codeRh, magasinsCodes);
-        const codeFinal = code || codeRh;
-        if (!reconnu) sitesNonReconnus.set(codeFinal, nomsSites[i] || '');
+      sitesUniques.forEach(({ reconnu, nom }, codeFinal) => {
+        if (!reconnu) sitesNonReconnus.set(codeFinal, nom);
         stmts.push(env.DB.prepare(
           `INSERT INTO rh_effectif_site_mensuel (mois, matricule, code_site, site_reconnu, poste_categorie, poids)
            VALUES (?, ?, ?, ?, ?, ?)`
