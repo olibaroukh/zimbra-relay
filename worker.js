@@ -3385,7 +3385,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -4770,7 +4770,16 @@ if (url.pathname === '/rh-import/effectif') {
       const nomsSitesRaw = String(row['Noms sites'] ?? '').trim();
       const codesSites = codesSitesRaw ? codesSitesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
       const nomsSites = nomsSitesRaw ? nomsSitesRaw.split(',').map(s => s.trim()) : [];
-      const nbSites = codesSites.length;
+      // Dédoublonnage APRÈS mapping : l'export RH peut répéter un site dans la même cellule
+      // (ex: "163002,163002,163001" ou "137002_F0125,137002_F0125,137002" → tous "137002"),
+      // ce qui violait la PK (mois, matricule, code_site).
+      const sitesUniques = new Map();
+      codesSites.forEach((codeRh, i) => {
+        const { code, reconnu } = rhMapCodeSiteVersMagasin(codeRh, magasinsCodes);
+        const codeFinal = code || codeRh;
+        if (!sitesUniques.has(codeFinal)) sitesUniques.set(codeFinal, { reconnu, nom: nomsSites[i] || '' });
+      });
+      const nbSites = sitesUniques.size;
       if (!nbSites) nbSansSite++;
 
       stmts.push(env.DB.prepare(
@@ -4792,10 +4801,8 @@ if (url.pathname === '/rh-import/effectif') {
       // Idempotent : on repart de zéro sur la répartition par site de ce salarié pour ce mois avant réinsertion.
       stmts.push(env.DB.prepare(`DELETE FROM rh_effectif_site_mensuel WHERE mois = ? AND matricule = ?`).bind(mois, matricule));
 
-      codesSites.forEach((codeRh, i) => {
-        const { code, reconnu } = rhMapCodeSiteVersMagasin(codeRh, magasinsCodes);
-        const codeFinal = code || codeRh;
-        if (!reconnu) sitesNonReconnus.set(codeFinal, nomsSites[i] || '');
+      sitesUniques.forEach(({ reconnu, nom }, codeFinal) => {
+        if (!reconnu) sitesNonReconnus.set(codeFinal, nom);
         stmts.push(env.DB.prepare(
           `INSERT INTO rh_effectif_site_mensuel (mois, matricule, code_site, site_reconnu, poste_categorie, poids)
            VALUES (?, ?, ?, ?, ?, ?)`
