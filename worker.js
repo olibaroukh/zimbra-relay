@@ -4759,6 +4759,20 @@ if (url.pathname === '/rh-import/effectif') {
     let nbSalaries = 0, nbSansSite = 0;
     const stmts = [];
 
+    // Quota D1 gratuit = 100 000 lignes écrites/jour : un réimport ne réécrit la
+    // répartition par site que des salariés dont elle a changé (signature identique → rien).
+    const rhSignatureSites = list => list
+      .map(x => x.code_site + ':' + x.site_reconnu + ':' + x.poste_categorie + ':' + Number(x.poids).toFixed(6))
+      .sort().join('|');
+    const { results: sitesExistants } = await env.DB.prepare(
+      `SELECT matricule, code_site, site_reconnu, poste_categorie, poids FROM rh_effectif_site_mensuel WHERE mois = ?`
+    ).bind(mois).all();
+    const sitesParMatricule = new Map();
+    for (const r of sitesExistants) {
+      if (!sitesParMatricule.has(r.matricule)) sitesParMatricule.set(r.matricule, []);
+      sitesParMatricule.get(r.matricule).push(r);
+    }
+
     for (const row of rows) {
       const matricule = String(row['Matricule'] ?? '').trim();
       if (!matricule) continue;
@@ -4788,7 +4802,12 @@ if (url.pathname === '/rh-import/effectif') {
          ON CONFLICT(mois, matricule) DO UPDATE SET
            nom=excluded.nom, prenom=excluded.prenom, genre=excluded.genre, poste=excluded.poste,
            poste_categorie=excluded.poste_categorie, codes_sites=excluded.codes_sites, nb_sites=excluded.nb_sites,
-           date_entree=excluded.date_entree, date_depart=excluded.date_depart, created_at=excluded.created_at`
+           date_entree=excluded.date_entree, date_depart=excluded.date_depart, created_at=excluded.created_at
+         WHERE rh_effectif_mensuel.nom IS NOT excluded.nom OR rh_effectif_mensuel.prenom IS NOT excluded.prenom
+            OR rh_effectif_mensuel.genre IS NOT excluded.genre OR rh_effectif_mensuel.poste IS NOT excluded.poste
+            OR rh_effectif_mensuel.poste_categorie IS NOT excluded.poste_categorie OR rh_effectif_mensuel.codes_sites IS NOT excluded.codes_sites
+            OR rh_effectif_mensuel.nb_sites IS NOT excluded.nb_sites OR rh_effectif_mensuel.date_entree IS NOT excluded.date_entree
+            OR rh_effectif_mensuel.date_depart IS NOT excluded.date_depart`
       ).bind(
         mois, matricule,
         String(row['Nom'] ?? '').trim() || null, String(row['Prénom'] ?? '').trim() || null,
@@ -4798,11 +4817,17 @@ if (url.pathname === '/rh-import/effectif') {
         now
       ));
 
-      // Idempotent : on repart de zéro sur la répartition par site de ce salarié pour ce mois avant réinsertion.
-      stmts.push(env.DB.prepare(`DELETE FROM rh_effectif_site_mensuel WHERE mois = ? AND matricule = ?`).bind(mois, matricule));
+      sitesUniques.forEach(({ reconnu, nom }, codeFinal) => { if (!reconnu) sitesNonReconnus.set(codeFinal, nom); });
+      const nouveauxSites = [...sitesUniques.entries()].map(([codeFinal, { reconnu }]) => ({
+        code_site: codeFinal, site_reconnu: reconnu ? 1 : 0, poste_categorie: posteCategorie, poids: 1 / nbSites,
+      }));
+      const existants = sitesParMatricule.get(matricule) || [];
+      if (rhSignatureSites(existants) === rhSignatureSites(nouveauxSites)) continue;
 
-      sitesUniques.forEach(({ reconnu, nom }, codeFinal) => {
-        if (!reconnu) sitesNonReconnus.set(codeFinal, nom);
+      // Répartition changée : on repart de zéro pour ce salarié et ce mois.
+      if (existants.length) stmts.push(env.DB.prepare(`DELETE FROM rh_effectif_site_mensuel WHERE mois = ? AND matricule = ?`).bind(mois, matricule));
+
+      sitesUniques.forEach(({ reconnu }, codeFinal) => {
         stmts.push(env.DB.prepare(
           `INSERT INTO rh_effectif_site_mensuel (mois, matricule, code_site, site_reconnu, poste_categorie, poids)
            VALUES (?, ?, ?, ?, ?, ?)`
@@ -4877,7 +4902,13 @@ if (url.pathname === '/rh-import/agenda') {
            type_contrat=excluded.type_contrat, jours_groupe_a=excluded.jours_groupe_a, jours_groupe_b=excluded.jours_groupe_b,
            jours_calendaires=excluded.jours_calendaires, jours_repos_hebdo=excluded.jours_repos_hebdo, jours_feries=excluded.jours_feries,
            jours_fermeture_magasin=excluded.jours_fermeture_magasin, jours_ouvres_theoriques=excluded.jours_ouvres_theoriques,
-           maladie_at_jours=excluded.maladie_at_jours, longue_duree=excluded.longue_duree, created_at=excluded.created_at`
+           maladie_at_jours=excluded.maladie_at_jours, longue_duree=excluded.longue_duree, created_at=excluded.created_at
+         WHERE rh_agenda_mensuel.type_contrat IS NOT excluded.type_contrat OR rh_agenda_mensuel.jours_groupe_a IS NOT excluded.jours_groupe_a
+            OR rh_agenda_mensuel.jours_groupe_b IS NOT excluded.jours_groupe_b OR rh_agenda_mensuel.jours_calendaires IS NOT excluded.jours_calendaires
+            OR rh_agenda_mensuel.jours_repos_hebdo IS NOT excluded.jours_repos_hebdo OR rh_agenda_mensuel.jours_feries IS NOT excluded.jours_feries
+            OR rh_agenda_mensuel.jours_fermeture_magasin IS NOT excluded.jours_fermeture_magasin
+            OR rh_agenda_mensuel.jours_ouvres_theoriques IS NOT excluded.jours_ouvres_theoriques
+            OR rh_agenda_mensuel.maladie_at_jours IS NOT excluded.maladie_at_jours OR rh_agenda_mensuel.longue_duree IS NOT excluded.longue_duree`
       ).bind(
         mois, matricule, String(row['Type contrat'] ?? '').trim() || null,
         joursGroupeA, joursGroupeB, joursCalendaires, reposHebdo, feries, fermeture, joursOuvresTheoriques,
