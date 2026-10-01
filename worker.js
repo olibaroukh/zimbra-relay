@@ -4756,7 +4756,7 @@ if (url.pathname === '/rh-import/effectif') {
 
     const now = new Date().toISOString();
     const sitesNonReconnus = new Map();
-    let nbSalaries = 0, nbSansSite = 0;
+    let nbSalaries = 0, nbSansSite = 0, nbHorsReseau = 0, nbImportes = 0;
     const stmts = [];
 
     // Quota D1 gratuit = 100 000 lignes écrites/jour : un réimport ne réécrit la
@@ -4795,6 +4795,22 @@ if (url.pathname === '/rh-import/effectif') {
       });
       const nbSites = sitesUniques.size;
       if (!nbSites) nbSansSite++;
+
+      // L'export RH couvre tout le groupe (siège, OC Mobile, Belgique, magasins
+      // hors magasins.csv…). Seuls les salariés rattachés à au moins un magasin
+      // du réseau sont enregistrés : toutes les lectures filtrent sur
+      // site_reconnu = 1, les autres ne servaient à rien et coûtaient environ
+      // 80 % du quota D1 d'écriture (01/10). Si le salarié était déjà présent
+      // pour ce mois (import précédent), sa répartition est retirée.
+      const dansReseau = [...sitesUniques.values()].some(x => x.reconnu);
+      if (!dansReseau) {
+        if (nbSites) nbHorsReseau++;
+        if ((sitesParMatricule.get(matricule) || []).length) {
+          stmts.push(env.DB.prepare(`DELETE FROM rh_effectif_site_mensuel WHERE mois = ? AND matricule = ?`).bind(mois, matricule));
+        }
+        continue;
+      }
+      nbImportes++;
 
       stmts.push(env.DB.prepare(
         `INSERT INTO rh_effectif_mensuel (mois, matricule, nom, prenom, genre, poste, poste_categorie, codes_sites, nb_sites, date_entree, date_depart, created_at)
@@ -4840,11 +4856,29 @@ if (url.pathname === '/rh-import/effectif') {
     }
 
     return new Response(JSON.stringify({
-      ok: true, mois, nbSalaries, nbSansSite,
+      ok: true, mois, nbSalaries, nbSansSite, nbHorsReseau, nbImportes,
       sitesNonReconnus: [...sitesNonReconnus.entries()].map(([code, nom]) => ({ code, nom })),
     }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
   } catch (e) {
     return jsonError('Erreur import effectif : ' + String(e), 500, corsHeaders);
+  }
+}
+
+// Mois RH déjà en base, pour qu'import.html demande confirmation avant
+// d'écraser un mois existant (incident du 30/09 : septembre importé sous août).
+if (url.pathname === '/rh-import/mois-existants') {
+  const storeToken = request.headers.get('X-Store-Token');
+  if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+  if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+  const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+  if (sessionAr !== 'ALL') return jsonError('Réservé à Olivier', 403, corsHeaders);
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT mois, COUNT(DISTINCT matricule) AS nb FROM rh_effectif_site_mensuel WHERE site_reconnu = 1 GROUP BY mois ORDER BY mois DESC`
+    ).all();
+    return new Response(JSON.stringify({ ok: true, mois: results || [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+  } catch (e) {
+    return jsonError('Erreur lecture mois RH : ' + String(e), 500, corsHeaders);
   }
 }
 
@@ -4862,6 +4896,19 @@ if (url.pathname === '/rh-import/agenda') {
     if (!/^\d{4}-\d{2}$/.test(mois)) return jsonError('Champ "mois" requis, format YYYY-MM', 400, corsHeaders);
     if (!rows.length) return jsonError('Aucune ligne à importer', 400, corsHeaders);
 
+    // Agenda filtré sur les salariés du réseau enregistrés par l'import
+    // effectif du même mois (à envoyer AVANT l'agenda). Comparaison sans les
+    // zéros de tête au cas où les deux exports ne formatent pas le matricule
+    // pareil.
+    const matKey = m => String(m ?? '').trim().replace(/^0+/, '');
+    const { results: reseauRows } = await env.DB.prepare(
+      `SELECT DISTINCT matricule FROM rh_effectif_site_mensuel WHERE mois = ? AND site_reconnu = 1`
+    ).bind(mois).all();
+    const matriculesReseau = new Set(reseauRows.map(r => matKey(r.matricule)));
+    if (!matriculesReseau.size) {
+      return jsonError(`Aucun salarié du réseau pour ${mois} : importer l'effectif avant l'agenda`, 400, corsHeaders);
+    }
+
     const joursCalendaires = rhJoursDansMois(mois);
     const moisPrecedent = rhMoisPrecedent(mois);
     const { results: prevRows } = await env.DB.prepare(
@@ -4871,12 +4918,14 @@ if (url.pathname === '/rh-import/agenda') {
 
     const now = new Date().toISOString();
     const stmts = [];
-    let nbSalaries = 0, nbLongueDuree = 0;
+    let nbSalaries = 0, nbLongueDuree = 0, nbHorsReseau = 0, nbImportes = 0;
 
     for (const row of rows) {
       const matricule = String(row['Matricule'] ?? '').trim();
       if (!matricule) continue;
       nbSalaries++;
+      if (!matriculesReseau.has(matKey(matricule))) { nbHorsReseau++; continue; }
+      nbImportes++;
 
       const joursGroupeA = rhSommeColonnes(row, RH_GROUPE_A_COLS);
       const joursGroupeB = rhSommeColonnes(row, RH_GROUPE_B_COLS);
@@ -4916,11 +4965,17 @@ if (url.pathname === '/rh-import/agenda') {
       ));
     }
 
+    // Garde-fou : un effectif réseau présent mais aucun matricule de l'agenda
+    // retrouvé = formats de matricule incompatibles, on n'écrit rien.
+    if (!nbImportes) {
+      return jsonError(`Aucun matricule de l'agenda ne correspond à l'effectif ${mois} (format de matricule différent ?)`, 400, corsHeaders);
+    }
+
     for (let i = 0; i < stmts.length; i += 400) {
       await env.DB.batch(stmts.slice(i, i + 400));
     }
 
-    return new Response(JSON.stringify({ ok: true, mois, nbSalaries, nbLongueDuree }), {
+    return new Response(JSON.stringify({ ok: true, mois, nbSalaries, nbLongueDuree, nbHorsReseau, nbImportes }), {
       status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
     });
   } catch (e) {
