@@ -931,6 +931,10 @@ frequence: "À chaque visite d'accompagnement." },
 description: "Import mensuel RH (effectif et absences), fermetures réseau, gestion de la page d'accueil.",
 usage: "Déposer les deux fichiers RH du mois écoulé, saisir les fermetures réseau, ajouter ou modifier les applis de l'accueil.",
 frequence: "Le 1er de chaque mois (rappel par mail)." },
+{ nom: 'Tour de France', url: 'https://olibaroukh.github.io/tour-de-france/', section: 'olivier', ordre: 2,
+description: "Planning de la tournée des magasins du réseau : étapes, déplacements, hébergements.",
+usage: "Consulter l'étape à venir et ajuster le planning au fil des passages.",
+frequence: "Avant chaque déplacement." },
 ];
 
 async function ensureAccueilTables(env) {
