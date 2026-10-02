@@ -881,6 +881,114 @@ function jsonError(msg, status, corsHeaders) {
 return new Response(JSON.stringify({ error: msg }), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 }
 
+// ── Page d'accueil (02/10) — bilan-passage/accueil ─────────────────────────
+// Lanceur unique des applis du réseau, en 4 sections : tous / animateurs /
+// formation / olivier. Le registre des applis (nom, lien, section, icône,
+// fiche explicative) vit en D1 (accueil_apps) et se gère depuis import.html.
+// Les droits par section sont calculés côté serveur au login, jamais par la
+// page : les liens d'une section non autorisée ne quittent jamais le Worker.
+// Tables créées et pré-remplies automatiquement au premier appel (aucune
+// requête à coller dans la console D1).
+const ACCUEIL_SECTIONS = ['tous', 'animateurs', 'formation', 'olivier'];
+const ACCUEIL_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 j : la session ne donne accès qu'à la liste des liens
+const ACCUEIL_ICONE_MAX = 400000; // caractères (data URL ~300 Ko)
+let _accueilTablesOk = false;
+
+const ACCUEIL_APPS_INITIALES = [
+{ nom: 'Pour être dans le vert', url: 'https://olibaroukh.github.io/pour-etre-dans-le-vert/pour_etre_dans_le_vert.html', section: 'tous', ordre: 1,
+description: "Synthèse de performance du magasin à partir des exports mensuels : indicateurs au vert ou au rouge, actions prioritaires, podium.",
+usage: "Charger les fichiers exportés (positionnement, stats optique et audio), vérifier le nom du magasin, générer puis envoyer le rapport.",
+frequence: "Deux fois par semaine." },
+{ nom: 'Kaizen', url: 'https://olibaroukh.github.io/kaizen/', section: 'tous', ordre: 2,
+description: "Audit mensuel du magasin : une centaine de points de contrôle répartis par zone, 50 points maximum, photos de preuve.",
+usage: "Chercher le magasin, ouvrir chaque zone et cocher les points conformes. L'audit peut se faire en plusieurs fois dans le mois.",
+frequence: "Une fois par mois. Clôture automatique le 1er du mois suivant." },
+{ nom: 'Suivi Managers', url: 'https://olibaroukh.github.io/suivi-managers/', section: 'tous', ordre: 3,
+description: "Trames d'entretien individuel (Écoute & Feedback, Pilotage, Valorisation, Remotivation, Recadrage) et lancement de journée.",
+usage: "Choisir le magasin puis la trame, remplir, faire signer et envoyer : le magasin reçoit le mail et le PDF. Les objectifs datés sont rappelés au prochain passage.",
+frequence: "Lancement de journée : chaque jour d'ouverture. Entretiens : au moins un par collaborateur et par mois." },
+{ nom: 'Bilan de Passage', url: 'https://olibaroukh.github.io/bilan-passage/', section: 'animateurs', ordre: 1,
+description: "Compte-rendu de visite magasin : humeur, chiffres, effectif, actions à suivre. Onglets Analyse et Tournée pour l'historique et le score de santé.",
+usage: "Sélectionner l'animateur et le magasin, remplir le bilan pendant la visite et l'envoyer (mail et PDF au magasin).",
+frequence: "À chaque visite, au moins toutes les 4 semaines par magasin." },
+{ nom: 'Évaluation Équipe', url: 'https://olibaroukh.github.io/evaluation-equipe/', section: 'animateurs', ordre: 2,
+description: "Évaluation des collaborateurs du magasin, tâche par tâche. Alimente la dimension Équipe du score de santé.",
+usage: "Choisir le magasin, évaluer chaque collaborateur et enregistrer. Peut être jointe automatiquement au mail du bilan de passage.",
+frequence: "Lors des visites, dès que le niveau d'un collaborateur évolue." },
+{ nom: 'Observations Terrain', url: 'https://olibaroukh.github.io/observations-terrain/observations_terrain.html', section: 'animateurs', ordre: 3,
+description: "Notes prises au fil de l'eau sur les magasins (et infos générales), reprises dans la com hebdo du dimanche.",
+usage: "Choisir le magasin, saisir ou dicter l'observation. « Terminer la journée » envoie un récapitulatif par magasin.",
+frequence: "Au fil de l'eau, clôture en fin de journée." },
+{ nom: 'Dashboard', url: 'https://olibaroukh.github.io/bilan-passage/dashboard.html', section: 'animateurs', ordre: 4,
+description: "Vue d'ensemble de votre périmètre : score de santé, alertes, fiche de chaque magasin avec accès direct aux applis.",
+usage: "Se connecter avec son identifiant Zimbra, repérer les magasins en alerte, ouvrir leur fiche.",
+frequence: "En début de semaine et avant chaque tournée." },
+{ nom: 'Accompagnement Manager', url: 'https://olibaroukh.github.io/accompagnement-manager/', section: 'formation', ordre: 1,
+description: "Compte-rendu de visite d'accompagnement d'un manager : équipe présente, collaborateurs, suivi qualité, SWOT, plan d'actions.",
+usage: "Sur tablette pendant la visite, remplir étape par étape puis envoyer au manager et à son animateur.",
+frequence: "À chaque visite d'accompagnement." },
+{ nom: 'Imports', url: 'https://olibaroukh.github.io/bilan-passage/import.html', section: 'olivier', ordre: 1,
+description: "Import mensuel RH (effectif et absences), fermetures réseau, gestion de la page d'accueil.",
+usage: "Déposer les deux fichiers RH du mois écoulé, saisir les fermetures réseau, ajouter ou modifier les applis de l'accueil.",
+frequence: "Le 1er de chaque mois (rappel par mail)." },
+{ nom: 'Tour de France', url: 'https://olibaroukh.github.io/tour-de-france/', section: 'olivier', ordre: 2,
+description: "Planning de la tournée des magasins du réseau : étapes, déplacements, hébergements.",
+usage: "Consulter l'étape à venir et ajuster le planning au fil des passages.",
+frequence: "Avant chaque déplacement." },
+];
+
+async function ensureAccueilTables(env) {
+if (_accueilTablesOk) return;
+await env.DB.prepare(`CREATE TABLE IF NOT EXISTS accueil_apps (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT NOT NULL, url TEXT NOT NULL, section TEXT NOT NULL, icone TEXT, description TEXT, usage TEXT, frequence TEXT, ordre INTEGER DEFAULT 0, actif INTEGER DEFAULT 1, updated_at TEXT)`).run();
+await env.DB.prepare(`CREATE TABLE IF NOT EXISTS accueil_acces (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, section TEXT NOT NULL, created_at TEXT, UNIQUE(email, section))`).run();
+await env.DB.prepare(`CREATE TABLE IF NOT EXISTS accueil_meta (key TEXT PRIMARY KEY, value TEXT)`).run();
+const seeded = await env.DB.prepare(`SELECT value FROM accueil_meta WHERE key = 'seeded'`).first();
+if (!seeded) {
+const now = new Date().toISOString();
+const stmts = ACCUEIL_APPS_INITIALES.map(a => env.DB.prepare(
+`INSERT INTO accueil_apps (nom, url, section, icone, description, usage, frequence, ordre, actif, updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 1, ?)`
+).bind(a.nom, a.url, a.section, a.description, a.usage, a.frequence, a.ordre, now));
+stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO accueil_acces (email, section, created_at) VALUES (?, 'formation', ?)`).bind('emilie.nahon@optical-center.com', now));
+stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO accueil_meta (key, value) VALUES ('seeded', ?)`).bind(now));
+await env.DB.batch(stmts);
+}
+_accueilTablesOk = true;
+}
+
+async function createAccueilSession(email, nom, sections) {
+const payload = JSON.stringify({ kind: 'accueil', email, nom, sections, exp: Date.now() + ACCUEIL_SESSION_TTL_MS });
+const b64 = btoa(unescape(encodeURIComponent(payload)));
+const sig = await hmacSign(b64);
+return b64 + '.' + sig;
+}
+
+// Pas de champ `ar` dans le payload : un jeton d'accueil n'est donc jamais
+// accepté par verifyArSession (routes Analyse, Dashboard, imports…).
+async function verifyAccueilSession(token) {
+if (!AR_SESSION_SECRET) return null;
+if (!token || !token.includes('.')) return null;
+const [b64, sig] = token.split('.');
+const expectedSig = await hmacSign(b64);
+if (sig !== expectedSig) return null;
+let payload;
+try { payload = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch(e) { return null; }
+if (!payload || payload.kind !== 'accueil' || !payload.exp || payload.exp < Date.now() || !Array.isArray(payload.sections)) return null;
+return payload;
+}
+
+// Admin de l'accueil : Olivier, via sa session d'accueil (section "olivier")
+// ou via la session /ar-login déjà utilisée par import.html (ar === 'ALL').
+async function isAccueilAdmin(request) {
+const ar = await verifyArSession(request.headers.get('X-AR-Session'));
+if (ar === 'ALL') return true;
+const acc = await verifyAccueilSession(request.headers.get('X-Accueil-Session'));
+return !!(acc && acc.sections.includes('olivier'));
+}
+
+function accueilAppRow(r) {
+return { id: r.id, nom: r.nom, url: r.url, section: r.section, icone: r.icone || '', description: r.description || '', usage: r.usage || '', frequence: r.frequence || '', ordre: r.ordre || 0, actif: r.actif ? 1 : 0 };
+}
+
 function bilanMagasinLabel(b) {
 return b.magasin?.libelle || b.magasin_libelle || '?';
 }
@@ -3375,7 +3483,7 @@ await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session',
+'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session, X-Accueil-Session',
 'Access-Control-Max-Age': '86400',
 };
 
@@ -3385,7 +3493,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -3536,6 +3644,137 @@ return new Response(JSON.stringify({ ok: true, sessionToken, ar, expiresInMs: AR
 status: 200,
 headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
+}
+
+// ── Page d'accueil (02/10) : login, liste des applis, administration ──────
+if (url.pathname === '/accueil-login') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+await ensureAccueilTables(env);
+const { zimbraUser, zimbraPass } = await request.json();
+if (!zimbraUser || !zimbraPass) return jsonError('Identifiant et mot de passe requis', 400, corsHeaders);
+const user = String(zimbraUser).trim();
+const authResp = await fetch(ZIMBRA_SOAP_URL, {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({
+Header: { context: { _jsns: 'urn:zimbra', format: { _content: 'js', type: 'js' } } },
+Body: { AuthRequest: { _jsns: 'urn:zimbraAccount', account: { by: 'name', _content: user }, password: { _content: zimbraPass } } }
+})
+});
+const authData = await authResp.json();
+const zimbraToken = authData?.Body?.AuthResponse?.authToken?.[0]?._content;
+if (!zimbraToken) return jsonError('Identifiants Zimbra invalides', 401, corsHeaders);
+
+const emailLower = user.toLowerCase();
+const localPart = emailLower.split('@')[0];
+const normalizedLogin = normalizeName(localPart);
+const nom = localPart.split('.').map(p => p ? p.charAt(0).toUpperCase() + p.slice(1) : p).join(' ');
+const sections = new Set(['tous']);
+// Même résolution d'identité que /ar-login (sans l'alerte mail : ici une
+// personne qui n'est pas animateur peut légitimement se connecter).
+let ar = null;
+if (normalizedLogin.includes('baroukh')) {
+ar = 'ALL';
+} else {
+const stores = await getMagasinsServerSide();
+const emailMatch = stores.find(s => s.animateurEmail && s.animateurEmail.trim().toLowerCase() === emailLower);
+if (emailMatch) ar = emailMatch.animateur;
+else {
+const uniqueARs = [...new Set(stores.map(s => s.animateur).filter(Boolean))];
+ar = uniqueARs.find(a => normalizeName(a) === normalizedLogin) || null;
+}
+}
+if (ar === 'ALL') ACCUEIL_SECTIONS.forEach(s => sections.add(s));
+else if (ar) sections.add('animateurs');
+const { results: acces } = await env.DB.prepare(`SELECT section FROM accueil_acces WHERE lower(email) = ?`).bind(emailLower).all();
+for (const a of (acces || [])) if (ACCUEIL_SECTIONS.includes(a.section)) sections.add(a.section);
+
+const sectionsList = ACCUEIL_SECTIONS.filter(s => sections.has(s));
+const token = await createAccueilSession(emailLower, nom, sectionsList);
+// Session AR standard en plus pour les animateurs et Olivier : la page
+// d'accueil la dépose dans le navigateur pour que Bilan de Passage, le
+// Dashboard et les imports soient déjà connectés (même domaine).
+const arSession = ar ? { token: await createArSession(ar), ar, expiresInMs: AR_SESSION_TTL_MS } : null;
+return new Response(JSON.stringify({ ok: true, token, nom, sections: sectionsList, expiresInMs: ACCUEIL_SESSION_TTL_MS, arSession }), {
+status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+}
+
+if (url.pathname === '/accueil-apps') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+await ensureAccueilTables(env);
+const session = await verifyAccueilSession(request.headers.get('X-Accueil-Session'));
+const sections = session ? session.sections : ['tous'];
+const placeholders = sections.map(() => '?').join(',');
+const { results } = await env.DB.prepare(
+`SELECT * FROM accueil_apps WHERE actif = 1 AND section IN (${placeholders}) ORDER BY section, ordre, nom`
+).bind(...sections).all();
+return new Response(JSON.stringify({ ok: true, sections, nom: session ? session.nom : null, sessionValide: !!session, apps: (results || []).map(accueilAppRow) }), {
+status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+} catch (e) {
+return jsonError('Erreur lecture accueil : ' + String(e), 500, corsHeaders);
+}
+}
+
+// GET : toutes les applis (y compris masquées) + accès nominatifs.
+// POST {action: 'app-save' | 'app-delete' | 'acces-add' | 'acces-delete', ...}
+if (url.pathname === '/accueil-admin') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+if (!(await isAccueilAdmin(request))) return jsonError('Réservé à Olivier', 403, corsHeaders);
+try {
+await ensureAccueilTables(env);
+if (request.method === 'POST') {
+const body = await request.json();
+const now = new Date().toISOString();
+if (body.action === 'app-save') {
+const a = body.app || {};
+const nom = String(a.nom || '').trim().slice(0, 60);
+const lien = String(a.url || '').trim();
+const section = String(a.section || '');
+const icone = String(a.icone || '');
+if (!nom) return jsonError('Nom requis', 400, corsHeaders);
+if (!/^https:\/\/\S+$/.test(lien)) return jsonError('Lien invalide (doit commencer par https://)', 400, corsHeaders);
+if (!ACCUEIL_SECTIONS.includes(section)) return jsonError('Section inconnue', 400, corsHeaders);
+if (icone && !/^data:image\/(png|jpeg|webp|svg\+xml);base64,/.test(icone) && !/^https:\/\/\S+$/.test(icone)) return jsonError('Icône invalide', 400, corsHeaders);
+if (icone.length > ACCUEIL_ICONE_MAX) return jsonError('Icône trop lourde (300 Ko maximum)', 400, corsHeaders);
+const champs = [nom, lien, section, icone || null,
+String(a.description || '').slice(0, 600), String(a.usage || '').slice(0, 600), String(a.frequence || '').slice(0, 200),
+parseInt(a.ordre, 10) || 0, a.actif === 0 || a.actif === false ? 0 : 1, now];
+if (a.id) {
+await env.DB.prepare(`UPDATE accueil_apps SET nom = ?, url = ?, section = ?, icone = ?, description = ?, usage = ?, frequence = ?, ordre = ?, actif = ?, updated_at = ? WHERE id = ?`).bind(...champs, parseInt(a.id, 10)).run();
+} else {
+await env.DB.prepare(`INSERT INTO accueil_apps (nom, url, section, icone, description, usage, frequence, ordre, actif, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(...champs).run();
+}
+} else if (body.action === 'app-delete') {
+await env.DB.prepare(`DELETE FROM accueil_apps WHERE id = ?`).bind(parseInt(body.id, 10)).run();
+} else if (body.action === 'acces-add') {
+const email = String(body.email || '').trim().toLowerCase();
+const section = String(body.section || '');
+if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return jsonError('Adresse email invalide', 400, corsHeaders);
+if (!['animateurs', 'formation', 'olivier'].includes(section)) return jsonError('Section inconnue', 400, corsHeaders);
+await env.DB.prepare(`INSERT OR IGNORE INTO accueil_acces (email, section, created_at) VALUES (?, ?, ?)`).bind(email, section, now).run();
+} else if (body.action === 'acces-delete') {
+await env.DB.prepare(`DELETE FROM accueil_acces WHERE id = ?`).bind(parseInt(body.id, 10)).run();
+} else {
+return jsonError('Action inconnue', 400, corsHeaders);
+}
+}
+const { results: apps } = await env.DB.prepare(`SELECT * FROM accueil_apps ORDER BY section, ordre, nom`).all();
+const { results: acces } = await env.DB.prepare(`SELECT id, email, section FROM accueil_acces ORDER BY section, email`).all();
+return new Response(JSON.stringify({ ok: true, apps: (apps || []).map(accueilAppRow), acces: acces || [] }), {
+status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+} catch (e) {
+return jsonError('Erreur administration accueil : ' + String(e), 500, corsHeaders);
+}
 }
 
 if (url.pathname === '/accompagnement-login') {
