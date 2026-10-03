@@ -2197,8 +2197,11 @@ const lancParCode = {}; lancements.forEach(r => { lancParCode[r.magasin_code] = 
 const kaizenParCode = {}; kaizens.forEach(r => { kaizenParCode[r.magasin_code] = r; });
 const ratingParCode = {}; ratings.forEach(r => { ratingParCode[r.magasin_code] = r; });
 const fermSet = fermeturesReseauSet(fermetures);
-const joursOuvertsStd = compterJoursAttendus(mois, false, fermSet);
-const joursOuvertsAM = compterJoursAttendus(mois, true, fermSet);
+// Mois écoulé : tous les jours ouverts du mois. Mois en cours (aperçu) : jours
+// ouverts écoulés jusqu'à hier (même règle que le score de pilotage, 03/10 —
+// cas Bonneuil : 2 lancements sur 2 jours écoulés affichaient 7 %).
+const joursOuvertsStd = joursAttendusLancement(mois, false, fermSet);
+const joursOuvertsAM = joursAttendusLancement(mois, true, fermSet);
 const finMs = Date.parse(fin + 'T23:59:59Z');
 
 return stores.map(store => {
