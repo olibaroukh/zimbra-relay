@@ -1957,7 +1957,13 @@ const s = byCode.get(r.magasin_code); if (!s) continue;
 const L = res[s.code].lancement;
 const heure = activiteParisHeure(r.created_at);
 if (L.statut !== 'fait' || (heure && L.heure && heure < L.heure)) { L.statut = 'fait'; L.heure = heure; L.par = r.rempli_par || null; }
-pushEvent(s, 'lancement', 'Lancement de journée', r.rempli_par, r.created_at, heure);
+pushEvent(s, 'lancement', 'Lancement de journée' + (heure && heure > LANCEMENT_HEURE_BUTOIR ? ' (en retard)' : ''), r.rempli_par, r.created_at, heure);
+}
+// Lancement saisi après l'heure butoir (03/10, cas Franconville 12h19) : compté
+// comme fait, mais signalé « en retard ». Sans heure connue, jamais en retard.
+for (const code of Object.keys(res)) {
+const L = res[code].lancement;
+L.enRetard = L.statut === 'fait' && !!L.heure && L.heure > LANCEMENT_HEURE_BUTOIR;
 }
 for (const r of bilans) {
 const s = byCode.get(r.magasin_code); if (!s) continue;
