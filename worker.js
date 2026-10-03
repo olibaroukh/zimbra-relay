@@ -2525,6 +2525,21 @@ const version = (etat && nouveauStatut !== 'refusee') ? await santeReappliquer(e
 return json({ ok: true, version });
 }
 
+if (action === 'supprimer') {
+// 03/10 : suppression complète d'un mois NON validé (essais) — versions,
+// neutralisations et propositions. Le journal est conservé (trace de la suppression).
+const e = exigerOlivier(); if (e) return e;
+if (!etat) return jsonError('Ce mois n\'est pas calculé.', 400, corsHeaders);
+if (valide) return jsonError('Un mois validé ne peut pas être supprimé.', 409, corsHeaders);
+await env.DB.batch([
+env.DB.prepare(`DELETE FROM sante_mensuel WHERE mois = ?`).bind(mois),
+env.DB.prepare(`DELETE FROM sante_mensuel_neutralisations WHERE mois = ?`).bind(mois),
+env.DB.prepare(`DELETE FROM sante_mensuel_mois WHERE mois = ?`).bind(mois),
+]);
+await santeJournal(env, mois, 'suppression', { detail: { versionSupprimee: etat.version }, auteur });
+return json({ ok: true });
+}
+
 if (action === 'valider') {
 const e = exigerOlivier(); if (e) return e;
 if (!etat) return jsonError('Mois non calculé : lance d\'abord le calcul.', 400, corsHeaders);
