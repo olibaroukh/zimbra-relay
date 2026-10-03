@@ -2142,7 +2142,7 @@ await env.DB.prepare(`INSERT INTO sante_mensuel_journal (mois, magasin_code, act
 // Collecte des données du mois et calcul des 10 sous-scores bruts (avant
 // neutralisation). `figes` = { [code]: { avis, effTheo } } repris du premier
 // calcul du mois. Une requête groupée par source, jamais par magasin.
-async function collecterSanteMensuel(env, mois, stores, figes) {
+async function collecterSanteMensuel(env, mois, stores, figes, opts = {}) {
 const debut = mois + '-01';
 const fin = santeFinMois(mois);
 const moisM1 = santeMoisDecale(mois, -1);
@@ -2158,7 +2158,7 @@ q(`SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids) AS eff_total
 SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) AS eff_ld,
 SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
 FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
-WHERE es.site_reconnu = 1 AND es.mois IN (?, ?, ?) GROUP BY es.mois, es.code_site`, moisM2, moisM1, mois),
+WHERE es.site_reconnu = 1 AND es.mois >= ? AND es.mois <= ? GROUP BY es.mois, es.code_site`, santeMoisDecale(mois, -6), mois),
 q(`SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule
 FROM rh_effectif_site_mensuel es JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
 WHERE es.site_reconnu = 1 AND (em.poste IS NULL OR em.poste != 'Manager')
@@ -2197,8 +2197,11 @@ const lancParCode = {}; lancements.forEach(r => { lancParCode[r.magasin_code] = 
 const kaizenParCode = {}; kaizens.forEach(r => { kaizenParCode[r.magasin_code] = r; });
 const ratingParCode = {}; ratings.forEach(r => { ratingParCode[r.magasin_code] = r; });
 const fermSet = fermeturesReseauSet(fermetures);
-const joursOuvertsStd = compterJoursAttendus(mois, false, fermSet);
-const joursOuvertsAM = compterJoursAttendus(mois, true, fermSet);
+// Mois écoulé : tous les jours ouverts du mois. Mois en cours (aperçu) : jours
+// ouverts écoulés jusqu'à hier (même règle que le score de pilotage, 03/10 —
+// cas Bonneuil : 2 lancements sur 2 jours écoulés affichaient 7 %).
+const joursOuvertsStd = joursAttendusLancement(mois, false, fermSet);
+const joursOuvertsAM = joursAttendusLancement(mois, true, fermSet);
 const finMs = Date.parse(fin + 'T23:59:59Z');
 
 return stores.map(store => {
@@ -2234,31 +2237,52 @@ sous.equipe = Math.max(0, Math.min(100, (niveau / 10) * 100));
 entrees.equipe = { niveau, nbTaches: moyennes.length };
 } else { sous.equipe = 0; entrees.equipe = null; }
 
-// Effectif + Absentéisme : import RH du mois M (eff_theo figé au 1er calcul).
+// Effectif + Absentéisme (03/10, règle d'Olivier) :
+// - Effectif = effectif saisi dans le bilan de passage du mois (eff_opt + eff_audio)
+//   s'il existe, sinon effectif disponible de l'import RH du mois (hors longue
+//   durée), comparé à eff_theo (figé au 1er calcul). Sur-effectif : 100 − 25 × écart ;
+//   sous-effectif RH soutenu sur 3 mois consécutifs : 100 + 25 × écart moyen ; pire des deux.
+// - Absentéisme = taux de l'import RH du mois.
+// APERÇU uniquement (mois en cours, import RH pas encore fait) : le dernier import
+// RH disponible remplace celui du mois, signalé « indicatif ».
 const effTheo = fige && fige.effTheo !== undefined ? fige.effTheo : store.effTheo;
-const rhM = rh[code] && rh[code][mois];
 entrees.effTheo = effTheo;
-if (!rhM) {
-sous.effectif = null; exclusions.effectif = motifRhAbsent;
-sous.absenteisme = null; exclusions.absenteisme = motifRhAbsent;
-entrees.rh = null;
-} else {
+const rhM = rh[code] && rh[code][mois];
+let moisRhRef = rhM ? mois : null;
+if (!rhM && opts.apercu) {
+const moisRh = Object.keys(rh[code] || {}).filter(m => m <= mois).sort();
+moisRhRef = moisRh.length ? moisRh[moisRh.length - 1] : null;
+}
+const rRef = moisRhRef ? rh[code][moisRhRef] : null;
+const indicatif = !!(rRef && moisRhRef !== mois);
+entrees.rh = moisRhRef ? { mois: moisRhRef, indicatif } : null;
+
+if (rRef && rRef.taux !== null) {
+sous.absenteisme = santeArrondi1(Math.max(0, 100 - rRef.taux * 100));
+entrees.absenteisme = { tauxPct: santeArrondi1(rRef.taux * 100), rhMois: moisRhRef, indicatif };
+} else if (rRef) { sous.absenteisme = null; exclusions.absenteisme = 'Jours ouvrés théoriques nuls'; }
+else { sous.absenteisme = null; exclusions.absenteisme = opts.apercu ? 'Aucun import RH disponible' : motifRhAbsent; }
+
+let effBilan = null;
+if (b) { try { const mg = (JSON.parse(b.data_json || '{}').magasin) || {}; const o = toNumOrNull(mg.eff_opt), a = toNumOrNull(mg.eff_audio); if (o !== null && a !== null) effBilan = o + a; } catch (e) {} }
 if (effTheo === null || effTheo === undefined) { sous.effectif = null; exclusions.effectif = 'Effectif théorique non renseigné'; }
+else if (effBilan === null && !rRef) { sous.effectif = null; exclusions.effectif = opts.apercu ? 'Ni bilan du mois ni import RH disponible' : 'Ni effectif saisi dans un bilan du mois, ni ' + motifRhAbsent.charAt(0).toLowerCase() + motifRhAbsent.slice(1); }
 else {
-const delta = santeArrondi1(rhM.effectifDispo - effTheo);
+const base = effBilan !== null ? effBilan : rRef.effectifDispo;
+const delta = santeArrondi1(base - effTheo);
 let score = delta <= 0 ? 100 : Math.max(0, 100 - delta * 25);
-const r2 = rh[code][moisM2], r1 = rh[code][moisM1];
 let soutenu = false, ecartMoyen = null;
-if (r2 && r1) {
-const ecarts = [r2, r1, rhM].map(x => x.effectifDispo - effTheo);
+if (rRef) {
+const r1 = rh[code][santeMoisDecale(moisRhRef, -1)], r2 = rh[code][santeMoisDecale(moisRhRef, -2)];
+if (r1 && r2) {
+const ecarts = [r2, r1, rRef].map(x => x.effectifDispo - effTheo);
 if (ecarts.every(e => e < 0)) { soutenu = true; ecartMoyen = santeArrondi1(ecarts.reduce((s, e) => s + e, 0) / 3); score = Math.min(score, Math.max(0, 100 + ecartMoyen * 25)); }
 }
-sous.effectif = score;
-entrees.effectif = { effectifDispo: santeArrondi1(rhM.effectifDispo), delta, sousEffectifSoutenu: soutenu, ecartMoyen3Mois: ecartMoyen };
 }
-if (rhM.taux === null) { sous.absenteisme = null; exclusions.absenteisme = 'Jours ouvrés théoriques nuls'; }
-else { sous.absenteisme = santeArrondi1(Math.max(0, 100 - rhM.taux * 100)); entrees.absenteisme = { tauxPct: santeArrondi1(rhM.taux * 100) }; }
-entrees.rh = { mois };
+sous.effectif = score;
+entrees.effectif = { effectif: santeArrondi1(base), delta, sousEffectifSoutenu: soutenu, ecartMoyen3Mois: ecartMoyen,
+source: effBilan !== null ? 'bilan' : 'rh', bilanDate: effBilan !== null ? b.date : null, rhMois: effBilan !== null ? null : moisRhRef,
+indicatif: effBilan === null && indicatif };
 }
 
 // PEDLV : dernier envoi de la période M (D3).
@@ -2438,7 +2462,7 @@ else {
 // Aperçu indicatif (mois en cours ou mois non encore calculé) : rien n'est enregistré.
 apercu = true; poids = await getHealthWeights(env);
 const neutra = await santeNeutralisationsAppliquees(env, mois);
-lignes = (await collecterSanteMensuel(env, mois, stores, null)).map(l => {
+lignes = (await collecterSanteMensuel(env, mois, stores, null, { apercu: true })).map(l => {
 const n = neutra[l.code] || {};
 return { ...l, neutralisations: n, ...santeScoreFinal(l.sous, l.exclusions, new Set(Object.keys(n)), poids) };
 });
