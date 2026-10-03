@@ -2077,6 +2077,471 @@ return a.ts ? -1 : (b.ts ? 1 : 0);
 });
 return { jour, today, maintenant, butoir: LANCEMENT_HEURE_BUTOIR, magasins: Object.values(res), events: events.slice(0, 400) };
 }
+// ===========================================================================
+// Score de santé MENSUEL « primes » (03/10/2026) — voir doc projet
+// claude/cadrage-score-sante-mensuel-primes.md. Distinct du score de pilotage
+// (instantané, photo hebdo) qui n'est pas modifié.
+// - Calcul sur le mois civil, règles par dimension ci-dessous.
+// - Chaque calcul ou changement de neutralisation crée une NOUVELLE VERSION
+//   (rien n'est jamais écrasé) ; journal de toutes les actions.
+// - Poids figés au premier calcul du mois (D7) ; note Google et eff_theo
+//   (non historisés) figés au premier calcul et réutilisés aux recalculs.
+// - Neutralisation : dimension sortie du calcul (ni pénalité ni bonus).
+//   Proposée automatiquement ou par un AR, appliquée uniquement par Olivier.
+// - Validation par Olivier (gel) ; toute modification ensuite = révision
+//   avec motif obligatoire.
+// ===========================================================================
+const SANTE_REGLES_VERSION = '2026-10-03';
+const SANTE_DIMS = ['actions', 'effectif', 'absenteisme', 'positionnement', 'pedlv', 'avis', 'equipe', 'kaizen', 'entretiens', 'lancements'];
+// D5 : un AR absent neutralise tout ce qui vient de Bilan de Passage et d'Évaluation équipe.
+const SANTE_DIMS_AR_ABSENT = ['actions', 'positionnement', 'equipe'];
+const SANTE_SEUIL_COUVERTURE = 0.5; // D6
+const SANTE_AVIS_PERIME_JOURS = 35;
+const SANTE_MOIS_NOMS = {
+janvier: 1, fevrier: 2, mars: 3, avril: 4, mai: 5, juin: 6, juillet: 7, aout: 8, septembre: 9, octobre: 10, novembre: 11, decembre: 12,
+january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7, agosto: 8, septiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+};
+
+function santeMoisDecale(mois, n) {
+const [y, m] = mois.split('-').map(Number);
+const d = new Date(Date.UTC(y, m - 1 + n, 1));
+return d.toISOString().slice(0, 7);
+}
+function santeFinMois(mois) {
+const [y, m] = mois.split('-').map(Number);
+return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+}
+// D1 : contestation jusqu'au 5 du mois M+2 (primes versées avec un mois de décalage).
+function santeDateLimite(mois) { return santeMoisDecale(mois, 2) + '-05'; }
+// « octobre 2026 » / « October 2026 » → « 2026-10 » (période d'un envoi PEDLV).
+function santePeriodePedlvVersMois(periode) {
+if (!periode) return null;
+const s = String(periode).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const an = s.match(/(20\d{2})/);
+const nom = Object.keys(SANTE_MOIS_NOMS).find(k => new RegExp('\\b' + k + '\\b').test(s));
+if (!an || !nom) return null;
+return an[1] + '-' + String(SANTE_MOIS_NOMS[nom]).padStart(2, '0');
+}
+const santeArrondi1 = x => Math.round(x * 10) / 10;
+
+async function ensureSanteMensuelTables(env) {
+await env.DB.batch([
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS sante_mensuel_mois (mois TEXT PRIMARY KEY, statut TEXT NOT NULL, version INTEGER NOT NULL, poids_json TEXT, regles_version TEXT, calcule_le TEXT, calcule_par TEXT, valide_le TEXT, valide_par TEXT, revise_le TEXT)`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS sante_mensuel (mois TEXT NOT NULL, version INTEGER NOT NULL, magasin_code TEXT NOT NULL, magasin_libelle TEXT, animateur TEXT, score INTEGER, couverture REAL, sous_scores_json TEXT, exclusions_json TEXT, neutralisations_json TEXT, entrees_json TEXT, created_at TEXT, PRIMARY KEY (mois, version, magasin_code))`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS sante_mensuel_neutralisations (id INTEGER PRIMARY KEY AUTOINCREMENT, mois TEXT NOT NULL, magasin_code TEXT NOT NULL, dimension TEXT NOT NULL, motif TEXT, statut TEXT NOT NULL, origine TEXT, propose_par TEXT, propose_le TEXT, decide_par TEXT, decide_le TEXT)`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS sante_mensuel_journal (id INTEGER PRIMARY KEY AUTOINCREMENT, mois TEXT NOT NULL, magasin_code TEXT, action TEXT NOT NULL, detail TEXT, motif TEXT, auteur TEXT, le TEXT)`),
+]);
+}
+
+async function santeJournal(env, mois, action, { magasin = null, detail = null, motif = null, auteur = null } = {}) {
+await env.DB.prepare(`INSERT INTO sante_mensuel_journal (mois, magasin_code, action, detail, motif, auteur, le) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+.bind(mois, magasin, action, detail ? (typeof detail === 'string' ? detail : JSON.stringify(detail)) : null, motif, auteur, new Date().toISOString()).run();
+}
+
+// Collecte des données du mois et calcul des 10 sous-scores bruts (avant
+// neutralisation). `figes` = { [code]: { avis, effTheo } } repris du premier
+// calcul du mois. Une requête groupée par source, jamais par magasin.
+async function collecterSanteMensuel(env, mois, stores, figes) {
+const debut = mois + '-01';
+const fin = santeFinMois(mois);
+const moisM1 = santeMoisDecale(mois, -1);
+const moisM2 = santeMoisDecale(mois, -2);
+const q = async (sql, ...b) => { const { results } = await env.DB.prepare(sql).bind(...b).all(); return results || []; };
+
+const [bilans, notes, rhRows, rhElig, entretiens, lancements, kaizens, ratings, fermetures] = await Promise.all([
+q(`SELECT id, magasin_code, date, ca_annuel, data_json FROM (
+SELECT id, magasin_code, date, ca_annuel, data_json, ROW_NUMBER() OVER (PARTITION BY magasin_code ORDER BY date DESC, id DESC) AS rn
+FROM bilans WHERE date >= ? AND date <= ?) WHERE rn = 1`, debut, fin),
+q(`SELECT magasin_code, tache, note FROM notes_equipe WHERE annee = ? AND date_controle <= ?`, Number(mois.slice(0, 4)), fin),
+q(`SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids) AS eff_total,
+SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) AS eff_ld,
+SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
+FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
+WHERE es.site_reconnu = 1 AND es.mois IN (?, ?, ?) GROUP BY es.mois, es.code_site`, moisM2, moisM1, mois),
+q(`SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule
+FROM rh_effectif_site_mensuel es JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
+WHERE es.site_reconnu = 1 AND (em.poste IS NULL OR em.poste != 'Manager')
+AND es.mois = (SELECT MAX(mois) FROM rh_effectif_site_mensuel WHERE mois <= ?)`, mois),
+q(`SELECT DISTINCT magasin_code, collaborateur_matricule FROM entretiens_manager
+WHERE date >= ? AND date <= ? AND type IN (${TYPES_ENTRETIENS_COMPTES.map(() => '?').join(',')}) AND collaborateur_matricule IS NOT NULL`,
+debut, fin, ...TYPES_ENTRETIENS_COMPTES),
+q(`SELECT magasin_code, COUNT(DISTINCT date) AS jours FROM lancements_journee WHERE date >= ? AND date <= ? GROUP BY magasin_code`, debut, fin),
+q(`SELECT magasin_code, score, score_max, closed FROM kaizen_audits WHERE mois = ?`, mois),
+q(`SELECT magasin_code, rating, reviews_count, updated_at FROM google_ratings`),
+getFermeturesReseau(env),
+]);
+// PEDLV : tous les envois conservés (24 mois), dernier envoi dont la période = M (D3).
+await ensureRetentionColumns(env);
+const pedlvRows = await q(`SELECT id, magasin, code_magasin, periode, date_extraction, indicateurs_json, created_at FROM store_stats
+WHERE created_at >= ? ORDER BY id ASC`, santeMoisDecale(mois, -1) + '-01');
+const aliasResolution = await getStoreStatsAliasResolution(env);
+const storesByCode = new Map(stores.map(s => [s.code, s]));
+const pedlvParCle = {};
+for (const r of pedlvRows) {
+if (santePeriodePedlvVersMois(r.periode) !== mois) continue;
+pedlvParCle[resolveStoreStatsKey(r, aliasResolution, storesByCode)] = r; // ordre croissant : le dernier gagne
+}
+
+const bilanParCode = {}; bilans.forEach(r => { bilanParCode[r.magasin_code] = r; });
+const notesParCode = {};
+notes.forEach(n => { ((notesParCode[n.magasin_code] ??= {})[n.tache] ??= []).push(n.note); });
+const rh = {};
+rhRows.forEach(r => { (rh[r.code_site] ??= {})[r.mois] = { effectifDispo: (r.eff_total || 0) - (r.eff_ld || 0), effectifTotal: r.eff_total || 0, taux: r.th > 0 ? r.ga / r.th : null }; });
+const rhMoisEligibles = rhElig.length ? rhElig[0].mois : null;
+const rhImportPresent = rhRows.some(r => r.mois === mois);
+const motifRhAbsent = rhImportPresent ? 'Aucun salarié rattaché à ce magasin dans l\'import RH du mois' : 'Import RH du mois absent';
+const eligibles = {}; rhElig.forEach(r => { (eligibles[r.code_site] ??= new Set()).add(r.matricule); });
+const vus = {}; entretiens.forEach(r => { (vus[r.magasin_code] ??= new Set()).add(r.collaborateur_matricule); });
+const lancParCode = {}; lancements.forEach(r => { lancParCode[r.magasin_code] = r.jours; });
+const kaizenParCode = {}; kaizens.forEach(r => { kaizenParCode[r.magasin_code] = r; });
+const ratingParCode = {}; ratings.forEach(r => { ratingParCode[r.magasin_code] = r; });
+const fermSet = fermeturesReseauSet(fermetures);
+const joursOuvertsStd = compterJoursAttendus(mois, false, fermSet);
+const joursOuvertsAM = compterJoursAttendus(mois, true, fermSet);
+const finMs = Date.parse(fin + 'T23:59:59Z');
+
+return stores.map(store => {
+const code = store.code;
+const fige = (figes && figes[code]) || null;
+const sous = {}; const exclusions = {}; const entrees = {}; const propositions = [];
+
+// Actions + Positionnement : dernier bilan de passage daté dans le mois.
+const b = bilanParCode[code];
+if (b) {
+let data = {}; try { data = JSON.parse(b.data_json || '{}'); } catch (e) {}
+const actions = Array.isArray(data.actions) ? data.actions : [];
+const reportees = actions.filter(a => a && a._fromPrevious);
+const penalite = reportees.reduce((acc, a) => acc + (a._status === 'todo' ? 25 : 15), 0);
+sous.actions = Math.max(0, 100 - penalite);
+const pos = toNumOrNull(b.ca_annuel);
+sous.positionnement = pos === null ? 0 : Math.max(0, Math.min(100, pos));
+entrees.bilan = { id: b.id, date: b.date, actionsReportees: reportees.length, actionsAFaire: reportees.filter(a => a._status === 'todo').length, positionnementAnnuel: pos };
+} else {
+sous.actions = 0; sous.positionnement = 0;
+entrees.bilan = null;
+propositions.push({ dimension: 'actions', motif: 'Aucun bilan de passage dans le mois' });
+propositions.push({ dimension: 'positionnement', motif: 'Aucun bilan de passage dans le mois' });
+}
+
+// Équipe : niveau Évaluation équipe au dernier jour du mois (moyenne des
+// 3 meilleures notes par tâche, puis moyenne des tâches — règle du pilotage).
+const taches = notesParCode[code];
+if (taches) {
+const moyennes = Object.values(taches).map(arr => { const t = [...arr].sort((x, y) => y - x).slice(0, 3); return t.reduce((s, n) => s + n, 0) / t.length; });
+const niveau = santeArrondi1(moyennes.reduce((s, m) => s + m, 0) / moyennes.length);
+sous.equipe = Math.max(0, Math.min(100, (niveau / 10) * 100));
+entrees.equipe = { niveau, nbTaches: moyennes.length };
+} else { sous.equipe = 0; entrees.equipe = null; }
+
+// Effectif + Absentéisme : import RH du mois M (eff_theo figé au 1er calcul).
+const effTheo = fige && fige.effTheo !== undefined ? fige.effTheo : store.effTheo;
+const rhM = rh[code] && rh[code][mois];
+entrees.effTheo = effTheo;
+if (!rhM) {
+sous.effectif = null; exclusions.effectif = motifRhAbsent;
+sous.absenteisme = null; exclusions.absenteisme = motifRhAbsent;
+entrees.rh = null;
+} else {
+if (effTheo === null || effTheo === undefined) { sous.effectif = null; exclusions.effectif = 'Effectif théorique non renseigné'; }
+else {
+const delta = santeArrondi1(rhM.effectifDispo - effTheo);
+let score = delta <= 0 ? 100 : Math.max(0, 100 - delta * 25);
+const r2 = rh[code][moisM2], r1 = rh[code][moisM1];
+let soutenu = false, ecartMoyen = null;
+if (r2 && r1) {
+const ecarts = [r2, r1, rhM].map(x => x.effectifDispo - effTheo);
+if (ecarts.every(e => e < 0)) { soutenu = true; ecartMoyen = santeArrondi1(ecarts.reduce((s, e) => s + e, 0) / 3); score = Math.min(score, Math.max(0, 100 + ecartMoyen * 25)); }
+}
+sous.effectif = score;
+entrees.effectif = { effectifDispo: santeArrondi1(rhM.effectifDispo), delta, sousEffectifSoutenu: soutenu, ecartMoyen3Mois: ecartMoyen };
+}
+if (rhM.taux === null) { sous.absenteisme = null; exclusions.absenteisme = 'Jours ouvrés théoriques nuls'; }
+else { sous.absenteisme = santeArrondi1(Math.max(0, 100 - rhM.taux * 100)); entrees.absenteisme = { tauxPct: santeArrondi1(rhM.taux * 100) }; }
+entrees.rh = { mois };
+}
+
+// PEDLV : dernier envoi de la période M (D3).
+const p = pedlvParCle[normalizeName(store.libelle)];
+const resume = p ? computePedlvSummary(p) : null;
+if (resume && resume.total) {
+sous.pedlv = Math.max(0, 100 - (resume.rouge / resume.total) * 100);
+entrees.pedlv = { envoiId: p.id, envoyeLe: p.created_at, periode: p.periode, dateExtraction: p.date_extraction, rouges: resume.rouge, total: resume.total };
+} else { sous.pedlv = 0; entrees.pedlv = null; }
+
+// Avis Google (D4) : note figée au premier calcul du mois.
+const avis = fige && fige.avis !== undefined ? fige.avis : (ratingParCode[code] ? { rating: ratingParCode[code].rating, reviews: ratingParCode[code].reviews_count, majLe: ratingParCode[code].updated_at } : null);
+entrees.avis = avis;
+if (avis && avis.rating) {
+sous.avis = Math.max(0, Math.min(100, (Number(avis.rating) / 5) * 100));
+const maj = avis.majLe ? Date.parse(String(avis.majLe).includes('T') ? avis.majLe : String(avis.majLe).replace(' ', 'T') + 'Z') : NaN;
+if (!isNaN(maj) && (finMs - maj) / 86400000 > SANTE_AVIS_PERIME_JOURS) propositions.push({ dimension: 'avis', motif: 'Note Google non rafraîchie depuis plus de ' + SANTE_AVIS_PERIME_JOURS + ' jours' });
+} else { sous.avis = null; exclusions.avis = 'Pas de note Google disponible'; }
+
+// Kaizen : score du mois M (/score max → /100).
+const k = kaizenParCode[code];
+if (k && k.score_max) { sous.kaizen = Math.max(0, Math.min(100, (k.score / k.score_max) * 100)); entrees.kaizen = { score: k.score, scoreMax: k.score_max, cloture: !!k.closed }; }
+else { sous.kaizen = 0; entrees.kaizen = null; }
+if (!store.concept) propositions.push({ dimension: 'kaizen', motif: 'Magasin non éligible Kaizen (concept non renseigné)' });
+
+// Entretiens : collaborateurs éligibles (RH du mois, hors managers) vus dans le mois.
+if (!rhMoisEligibles) { sous.entretiens = null; exclusions.entretiens = 'Aucun import RH disponible'; }
+else {
+const elig = eligibles[code] || new Set();
+if (!elig.size) { sous.entretiens = null; exclusions.entretiens = 'Aucun collaborateur éligible (RH ' + rhMoisEligibles + ')'; }
+else {
+const v = vus[code] || new Set(); let n = 0; elig.forEach(m => { if (v.has(m)) n++; });
+sous.entretiens = Math.round((n / elig.size) * 100);
+entrees.entretiens = { eligibles: elig.size, vus: n, rhMois: rhMoisEligibles };
+}
+}
+
+// Lancements : jours lancés / jours ouverts du mois.
+const joursOuverts = store.alsaceMoselle ? joursOuvertsAM : joursOuvertsStd;
+const joursLances = lancParCode[code] || 0;
+sous.lancements = joursOuverts ? Math.min(100, Math.round((joursLances / joursOuverts) * 100)) : 0;
+entrees.lancements = { joursLances, joursOuverts };
+
+for (const d of SANTE_DIMS) if (typeof sous[d] === 'number') sous[d] = santeArrondi1(sous[d]);
+return { code, libelle: store.libelle, animateur: store.animateur || null, sous, exclusions, entrees, propositions, figes: { avis, effTheo } };
+});
+}
+
+function santeScoreFinal(sous, exclusions, neutralisees, poids) {
+if (neutralisees.has('*')) return { score: null, couverture: 0 };
+let total = 0, possible = 0, totalPoids = 0;
+for (const d of SANTE_DIMS) {
+const p = Number(poids[d]) || 0;
+totalPoids += p;
+if (neutralisees.has(d) || sous[d] === null || sous[d] === undefined || exclusions[d]) continue;
+total += sous[d] * p; possible += p;
+}
+const couverture = totalPoids ? possible / totalPoids : 0;
+if (!possible || couverture < SANTE_SEUIL_COUVERTURE) return { score: null, couverture: santeArrondi1(couverture * 100) };
+return { score: Math.round(total / possible), couverture: santeArrondi1(couverture * 100) };
+}
+
+async function santeNeutralisationsAppliquees(env, mois) {
+const { results } = await env.DB.prepare(`SELECT id, magasin_code, dimension, motif, origine, propose_par, decide_par, decide_le FROM sante_mensuel_neutralisations WHERE mois = ? AND statut = 'appliquee'`).bind(mois).all();
+const map = {};
+(results || []).forEach(r => { (map[r.magasin_code] ??= {})[r.dimension] = { id: r.id, motif: r.motif, origine: r.origine, proposePar: r.propose_par, par: r.decide_par, le: r.decide_le }; });
+return map;
+}
+
+// Écrit une nouvelle version complète du mois (lignes = résultat de collecterSanteMensuel
+// ou copie de la version précédente). Une seule requête groupée (batch).
+async function santeEcrireVersion(env, mois, lignes, poids, auteur, opts = {}) {
+const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+const version = etat ? etat.version + 1 : 1;
+const neutra = await santeNeutralisationsAppliquees(env, mois);
+const now = new Date().toISOString();
+const stmts = lignes.map(l => {
+const n = neutra[l.code] || {};
+const { score, couverture } = santeScoreFinal(l.sous, l.exclusions, new Set(Object.keys(n)), poids);
+return env.DB.prepare(`INSERT INTO sante_mensuel (mois, version, magasin_code, magasin_libelle, animateur, score, couverture, sous_scores_json, exclusions_json, neutralisations_json, entrees_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+.bind(mois, version, l.code, l.libelle, l.animateur, score, couverture, JSON.stringify(l.sous), JSON.stringify(l.exclusions || {}), JSON.stringify(n), JSON.stringify({ ...l.entrees, _figes: l.figes }), now);
+});
+if (etat) {
+stmts.push(env.DB.prepare(`UPDATE sante_mensuel_mois SET version = ?, calcule_le = ?, calcule_par = ?, revise_le = CASE WHEN statut = 'valide' THEN ? ELSE revise_le END WHERE mois = ?`).bind(version, now, auteur, now, mois));
+} else {
+stmts.push(env.DB.prepare(`INSERT INTO sante_mensuel_mois (mois, statut, version, poids_json, regles_version, calcule_le, calcule_par) VALUES (?, 'provisoire', ?, ?, ?, ?, ?)`).bind(mois, version, JSON.stringify(poids), SANTE_REGLES_VERSION, now, auteur));
+}
+for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+return version;
+}
+
+async function santeLignesVersion(env, mois, version) {
+const { results } = await env.DB.prepare(`SELECT * FROM sante_mensuel WHERE mois = ? AND version = ?`).bind(mois, version).all();
+return (results || []).map(r => {
+let entrees = {}; try { entrees = JSON.parse(r.entrees_json || '{}'); } catch (e) {}
+const figes = entrees._figes || null; delete entrees._figes;
+return {
+code: r.magasin_code, libelle: r.magasin_libelle, animateur: r.animateur, score: r.score, couverture: r.couverture,
+sous: JSON.parse(r.sous_scores_json || '{}'), exclusions: JSON.parse(r.exclusions_json || '{}'),
+neutralisations: JSON.parse(r.neutralisations_json || '{}'), entrees, figes,
+};
+});
+}
+
+// Calcul (ou recalcul) complet d'un mois à partir des données. Crée une version.
+async function calculerSanteMensuel(env, mois, auteur, motif) {
+await ensureSanteMensuelTables(env);
+const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+const stores = (await getMagasinsServerSide()).filter(s => s.code);
+let poids, figes = null;
+if (etat) {
+poids = JSON.parse(etat.poids_json || '{}');
+figes = {};
+(await santeLignesVersion(env, mois, etat.version)).forEach(l => { if (l.figes) figes[l.code] = l.figes; });
+} else {
+poids = await getHealthWeights(env);
+}
+const lignes = await collecterSanteMensuel(env, mois, stores, figes);
+// Propositions automatiques : créées une seule fois par (magasin, dimension)
+// tant qu'aucune décision n'existe déjà.
+const { results: existantes } = await env.DB.prepare(`SELECT magasin_code, dimension FROM sante_mensuel_neutralisations WHERE mois = ?`).bind(mois).all();
+const deja = new Set((existantes || []).map(r => r.magasin_code + '|' + r.dimension));
+const now = new Date().toISOString();
+const nouvelles = [];
+lignes.forEach(l => l.propositions.forEach(p => {
+if (deja.has(l.code + '|' + p.dimension)) return;
+deja.add(l.code + '|' + p.dimension);
+nouvelles.push(env.DB.prepare(`INSERT INTO sante_mensuel_neutralisations (mois, magasin_code, dimension, motif, statut, origine, propose_par, propose_le) VALUES (?, ?, ?, ?, 'proposee', 'auto', 'Système', ?)`).bind(mois, l.code, p.dimension, p.motif, now));
+}));
+for (let i = 0; i < nouvelles.length; i += 50) await env.DB.batch(nouvelles.slice(i, i + 50));
+const version = await santeEcrireVersion(env, mois, lignes, poids, auteur);
+await santeJournal(env, mois, etat ? (etat.statut === 'valide' ? 'revision_recalcul' : 'recalcul') : 'calcul', { detail: { version, magasins: lignes.length, propositionsAuto: nouvelles.length }, motif: motif || null, auteur });
+return version;
+}
+
+// Recalcule seulement les scores finaux (mêmes sous-scores, mêmes entrées)
+// après un changement de neutralisation — nouvelle version, sans relire les données.
+async function santeReappliquer(env, mois, auteur) {
+const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+if (!etat) return null;
+const lignes = (await santeLignesVersion(env, mois, etat.version)).map(l => ({ ...l, entrees: l.entrees }));
+return santeEcrireVersion(env, mois, lignes, JSON.parse(etat.poids_json || '{}'), auteur);
+}
+
+// Cron du 1er : calcul provisoire du mois écoulé, uniquement s'il n'existe pas encore.
+async function calculerSanteMensuelProvisoireCron(env) {
+await ensureSanteMensuelTables(env);
+const mois = santeMoisDecale(parisTodayIso().slice(0, 7), -1);
+const etat = await env.DB.prepare(`SELECT mois FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+if (etat) return;
+await calculerSanteMensuel(env, mois, 'Calcul automatique (1er du mois)');
+}
+
+async function handleSanteMensuel(request, env, url, corsHeaders) {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+const estOlivier = sessionAr === 'ALL';
+const auteur = estOlivier ? 'Olivier' : sessionAr;
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+await ensureSanteMensuelTables(env);
+const stores = (await getMagasinsServerSide()).filter(s => s.code);
+const codesScope = new Set(stores.filter(s => estOlivier || s.animateur === sessionAr).map(s => s.code));
+const moisCourant = parisTodayIso().slice(0, 7);
+const moisOk = m => /^\d{4}-(0[1-9]|1[0-2])$/.test(m || '') && m <= moisCourant;
+
+if (request.method === 'GET') {
+const mois = url.searchParams.get('mois') || santeMoisDecale(moisCourant, -1);
+if (!moisOk(mois)) return jsonError('Mois invalide', 400, corsHeaders);
+const { results: moisCalcules } = await env.DB.prepare(`SELECT mois, statut, version FROM sante_mensuel_mois ORDER BY mois DESC`).all();
+const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+let lignes, apercu = false, poids;
+if (etat) { lignes = await santeLignesVersion(env, mois, etat.version); poids = JSON.parse(etat.poids_json || '{}'); }
+else {
+// Aperçu indicatif (mois en cours ou mois non encore calculé) : rien n'est enregistré.
+apercu = true; poids = await getHealthWeights(env);
+const neutra = await santeNeutralisationsAppliquees(env, mois);
+lignes = (await collecterSanteMensuel(env, mois, stores, null)).map(l => {
+const n = neutra[l.code] || {};
+return { ...l, neutralisations: n, ...santeScoreFinal(l.sous, l.exclusions, new Set(Object.keys(n)), poids) };
+});
+}
+// Mois précédent (dernière version enregistrée) pour l'évolution ▲/▼.
+const etatPrec = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(santeMoisDecale(mois, -1)).first();
+const prec = {};
+if (etatPrec) (await santeLignesVersion(env, etatPrec.mois, etatPrec.version)).forEach(l => { prec[l.code] = l.score; });
+const { results: props } = await env.DB.prepare(`SELECT * FROM sante_mensuel_neutralisations WHERE mois = ? AND statut = 'proposee' ORDER BY id`).bind(mois).all();
+const libelles = new Map(stores.map(s => [s.code, s]));
+const out = {
+ok: true, mois, apercu, estOlivier, moisCourant,
+statut: etat ? etat.statut : null, version: etat ? etat.version : null,
+calculeLe: etat ? etat.calcule_le : null, calculePar: etat ? etat.calcule_par : null,
+valideLe: etat ? etat.valide_le : null, validePar: etat ? etat.valide_par : null, reviseLe: etat ? etat.revise_le : null,
+reglesVersion: etat ? etat.regles_version : SANTE_REGLES_VERSION, dateLimite: santeDateLimite(mois),
+poids, dims: SANTE_DIMS, dimsArAbsent: SANTE_DIMS_AR_ABSENT,
+moisCalcules: moisCalcules || [],
+magasins: lignes.filter(l => codesScope.has(l.code)).map(l => ({ ...l, scorePrecedent: prec[l.code] ?? null, propositions: undefined, figes: undefined })),
+propositions: (props || []).filter(p => codesScope.has(p.magasin_code)).map(p => ({ ...p, libelle: (libelles.get(p.magasin_code) || {}).libelle || p.magasin_code, animateur: (libelles.get(p.magasin_code) || {}).animateur || null })),
+};
+if (estOlivier && url.searchParams.get('journal') === '1') {
+const { results: j } = await env.DB.prepare(`SELECT * FROM sante_mensuel_journal WHERE mois = ? ORDER BY id`).bind(mois).all();
+const { results: toutes } = await env.DB.prepare(`SELECT * FROM sante_mensuel_neutralisations WHERE mois = ? ORDER BY id`).bind(mois).all();
+out.journal = j || []; out.neutralisationsHistorique = toutes || [];
+}
+return json(out);
+}
+
+// POST : actions.
+let body; try { body = await request.json(); } catch (e) { return jsonError('Requête invalide', 400, corsHeaders); }
+const { action, mois } = body || {};
+if (!moisOk(mois)) return jsonError('Mois invalide', 400, corsHeaders);
+const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
+const valide = etat && etat.statut === 'valide';
+const motifRevision = String(body.motifRevision || '').trim();
+const exigerOlivier = () => estOlivier ? null : jsonError('Action réservée à Olivier', 403, corsHeaders);
+const exigerRevision = () => (valide && !motifRevision) ? jsonError('Mois validé : un motif de révision est obligatoire pour toute modification.', 409, corsHeaders) : null;
+const now = new Date().toISOString();
+
+if (action === 'calculer') {
+const e = exigerOlivier() || exigerRevision(); if (e) return e;
+if (mois >= moisCourant) return jsonError('Le mois en cours ne peut pas être calculé : il n\'est pas terminé.', 400, corsHeaders);
+const version = await calculerSanteMensuel(env, mois, auteur, motifRevision || null);
+return json({ ok: true, version });
+}
+
+if (action === 'neutraliser') {
+// Olivier : appliqué directement. AR : proposition, sans effet tant qu'Olivier ne l'a pas validée (D8).
+const motif = String(body.motif || '').trim();
+if (!motif) return jsonError('Motif obligatoire', 400, corsHeaders);
+let codes = Array.isArray(body.magasins) ? body.magasins.map(String) : [];
+let dims = Array.isArray(body.dimensions) ? body.dimensions.filter(d => d === '*' || SANTE_DIMS.includes(d)) : [];
+if (body.arAbsent) {
+codes = stores.filter(s => s.animateur === body.arAbsent).map(s => s.code);
+dims = SANTE_DIMS_AR_ABSENT.slice();
+}
+codes = codes.filter(c => codesScope.has(c));
+if (!codes.length || !dims.length) return jsonError('Aucun magasin ou aucune dimension valide', 400, corsHeaders);
+if (estOlivier) { const e = exigerRevision(); if (e) return e; }
+const statut = estOlivier ? 'appliquee' : 'proposee';
+const stmts = [];
+for (const c of codes) for (const d of dims) {
+stmts.push(env.DB.prepare(`UPDATE sante_mensuel_neutralisations SET statut = 'remplacee', decide_par = ?, decide_le = ? WHERE mois = ? AND magasin_code = ? AND dimension = ? AND statut IN ('proposee', 'appliquee')`).bind(auteur, now, mois, c, d));
+stmts.push(env.DB.prepare(`INSERT INTO sante_mensuel_neutralisations (mois, magasin_code, dimension, motif, statut, origine, propose_par, propose_le, decide_par, decide_le) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+.bind(mois, c, d, motif, statut, estOlivier ? 'olivier' : 'ar', auteur, now, estOlivier ? auteur : null, estOlivier ? now : null));
+}
+for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+await santeJournal(env, mois, estOlivier ? (valide ? 'revision_neutralisation' : 'neutralisation') : 'proposition_ar', { magasin: codes.length === 1 ? codes[0] : null, detail: { magasins: codes, dimensions: dims, arAbsent: body.arAbsent || null }, motif: motifRevision ? motif + ' — révision : ' + motifRevision : motif, auteur });
+const version = (estOlivier && etat) ? await santeReappliquer(env, mois, auteur) : null;
+return json({ ok: true, statut, version });
+}
+
+if (action === 'decider' || action === 'retirer') {
+const e = exigerOlivier() || exigerRevision(); if (e) return e;
+const ids = (Array.isArray(body.ids) ? body.ids : [body.id]).map(Number).filter(Boolean);
+if (!ids.length) return jsonError('Aucune neutralisation indiquée', 400, corsHeaders);
+const nouveauStatut = action === 'retirer' ? 'retiree' : (body.accepter ? 'appliquee' : 'refusee');
+const statutAttendu = action === 'retirer' ? 'appliquee' : 'proposee';
+const stmts = ids.map(id => env.DB.prepare(`UPDATE sante_mensuel_neutralisations SET statut = ?, decide_par = ?, decide_le = ? WHERE id = ? AND mois = ? AND statut = ?`).bind(nouveauStatut, auteur, now, id, mois, statutAttendu));
+for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+await santeJournal(env, mois, (valide ? 'revision_' : '') + (action === 'retirer' ? 'retrait_neutralisation' : (body.accepter ? 'proposition_acceptee' : 'proposition_refusee')), { detail: { ids }, motif: motifRevision || null, auteur });
+const version = (etat && nouveauStatut !== 'refusee') ? await santeReappliquer(env, mois, auteur) : null;
+return json({ ok: true, version });
+}
+
+if (action === 'valider') {
+const e = exigerOlivier(); if (e) return e;
+if (!etat) return jsonError('Mois non calculé : lance d\'abord le calcul.', 400, corsHeaders);
+if (valide) return jsonError('Mois déjà validé.', 409, corsHeaders);
+const { results: enAttente } = await env.DB.prepare(`SELECT COUNT(*) AS n FROM sante_mensuel_neutralisations WHERE mois = ? AND statut = 'proposee'`).bind(mois).all();
+if (enAttente[0].n > 0) return jsonError(enAttente[0].n + ' proposition(s) de neutralisation en attente : accepte-les ou refuse-les avant de valider.', 409, corsHeaders);
+const { results: rhCount } = await env.DB.prepare(`SELECT COUNT(*) AS n FROM rh_agenda_mensuel WHERE mois = ?`).bind(mois).all();
+const motifSansRh = String(body.motifSansRh || '').trim();
+if (!rhCount[0].n && !motifSansRh) return jsonError('RH_ABSENT', 409, corsHeaders);
+await env.DB.prepare(`UPDATE sante_mensuel_mois SET statut = 'valide', valide_le = ?, valide_par = ? WHERE mois = ?`).bind(now, auteur, mois).run();
+await santeJournal(env, mois, 'validation', { detail: { version: etat.version }, motif: motifSansRh ? 'Validé sans import RH : ' + motifSansRh : null, auteur });
+return json({ ok: true });
+}
+
+return jsonError('Action inconnue', 400, corsHeaders);
+}
+
 async function getFermeturesReseau(env) {
 if (!env.DB) return [];
 try {
@@ -3720,7 +4185,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -4495,6 +4960,12 @@ return new Response(JSON.stringify({ ok: true, results }), {
 status: 200,
 headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
+}
+
+if (url.pathname === '/sante-mensuel') {
+// Score de santé mensuel « primes » (03/10) — voir handleSanteMensuel().
+try { return await handleSanteMensuel(request, env, url, corsHeaders); }
+catch (e) { return jsonError('Erreur score mensuel : ' + String(e), 500, corsHeaders); }
 }
 
 if (url.pathname === '/activite-jour') {
@@ -7124,7 +7595,10 @@ ctx.waitUntil(withCronAlert(env, 'Relance visite', () => sendVisitReminders(env)
 } else if (cron === '0 8 1 * *') {
 ctx.waitUntil(withCronAlert(env, 'Bilan mensuel', () => sendMonthlyReport(env)));
 ctx.waitUntil(withCronAlert(env, 'Export mensuel éval équipe', () => envoyerExportMensuelEval(env)));
-ctx.waitUntil(withCronAlert(env, 'Clôture Kaizen', () => cloturerAuditsKaizen(env)));
+const clotureKaizen = withCronAlert(env, 'Clôture Kaizen', () => cloturerAuditsKaizen(env));
+ctx.waitUntil(clotureKaizen);
+// 03/10 : score de santé mensuel provisoire du mois écoulé, après la clôture Kaizen.
+ctx.waitUntil(clotureKaizen.then(() => withCronAlert(env, 'Score de santé mensuel (provisoire)', () => calculerSanteMensuelProvisoireCron(env))));
 ctx.waitUntil(withCronAlert(env, 'Rappel import RH', () => sendRhImportReminder(env)));
 } else if (cron === '0 4 * * MON' || cron === '0 4 * * WED' || cron === '0 4 * * FRI') {
 ctx.waitUntil(withCronAlert(env, 'Refresh Google ratings', () => refreshGoogleRatings(env)));
