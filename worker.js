@@ -1105,9 +1105,51 @@ const OLIVIER_EMAIL = 'olivier.baroukh@optical-center.com';
 // manuel dédié — generateObsComHebdo/formatObsEmail et les routes
 // /obs-generate, /obs-send ont été retirés le même jour (devenus redondants).
 
+// 03/10 : fin de la purge hebdomadaire. observations et store_stats sont
+// désormais conservées 24 mois glissants (horodatage created_at ajouté
+// automatiquement par ensureRetentionColumns, sans manipulation dans la
+// console D1). Le cron du dimanche 20h ne supprime plus que ce qui a plus de
+// 24 mois. Les lectures « de la semaine » (com hebdo, bilan hebdo, score de
+// santé, dashboard) filtrent sur created_at >= weeklyCutoffSql() — le dernier
+// dimanche 20h UTC, c'est-à-dire exactement le moment de l'ancienne purge —
+// donc leur comportement est strictement identique à avant.
+const RETENTION_MOIS = 24;
+let _retentionColsOk = false;
+async function ensureRetentionColumns(env) {
+if (_retentionColsOk || !env.DB) return;
+for (const t of ['store_stats', 'observations']) {
+try { await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN created_at TEXT`).run(); } catch (e) { /* colonne déjà présente */ }
+// Lignes antérieures au changement : toutes de la semaine en cours (purgées
+// le dimanche précédent), datées « maintenant » pour rester visibles.
+try { await env.DB.prepare(`UPDATE ${t} SET created_at = datetime('now') WHERE created_at IS NULL`).run(); } catch (e) {}
+}
+_retentionColsOk = true;
+}
+// Dernier dimanche 20h00 UTC écoulé, au format datetime('now') de SQLite.
+function weeklyCutoffSql() {
+const now = new Date();
+const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 20, 0, 0));
+d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+if (d > now) d.setUTCDate(d.getUTCDate() - 7);
+return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+// Lecture filtrée sur la semaine en cours, avec repli sur la lecture complète
+// si la colonne created_at n'existe pas (encore) — jamais de donnée perdue.
+async function selectSemaineEnCours(env, sqlFiltre, sqlRepli) {
+await ensureRetentionColumns(env);
+try {
+const { results } = await env.DB.prepare(sqlFiltre).bind(weeklyCutoffSql()).all();
+return results || [];
+} catch (e) {
+const { results } = await env.DB.prepare(sqlRepli).all();
+return results || [];
+}
+}
 async function purgeWeeklySources(env) {
-try { await env.DB.prepare('DELETE FROM observations').run(); } catch(e) { console.error('Purge observations échouée:', e); }
-try { await env.DB.prepare('DELETE FROM store_stats').run(); } catch(e) { console.error('Purge store_stats échouée:', e); }
+await ensureRetentionColumns(env);
+const limite = `-${RETENTION_MOIS} months`;
+try { await env.DB.prepare(`DELETE FROM observations WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge observations (> 24 mois) échouée:', e); }
+try { await env.DB.prepare(`DELETE FROM store_stats WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge store_stats (> 24 mois) échouée:', e); }
 }
 
 // 29/09 : semaine du lundi au SAMEDI (avant : lundi-vendredi, les bilans du
@@ -1182,7 +1224,7 @@ async function getStoreStatsMap(env) {
 if (!env.DB) return {};
 let results;
 try {
-({ results } = await env.DB.prepare('SELECT * FROM store_stats ORDER BY id DESC').all());
+results = await selectSemaineEnCours(env, 'SELECT * FROM store_stats WHERE created_at >= ? ORDER BY id DESC', 'SELECT * FROM store_stats ORDER BY id DESC');
 } catch(e) { return {}; }
 const aliasResolution = await getStoreStatsAliasResolution(env);
 const stores = await getMagasinsServerSide();
@@ -1203,7 +1245,7 @@ async function getStoreStatsCountMap(env) {
 if (!env.DB) return {};
 let results;
 try {
-({ results } = await env.DB.prepare('SELECT magasin, code_magasin FROM store_stats').all());
+results = await selectSemaineEnCours(env, 'SELECT magasin, code_magasin FROM store_stats WHERE created_at >= ?', 'SELECT magasin, code_magasin FROM store_stats');
 } catch(e) { return {}; }
 const aliasResolution = await getStoreStatsAliasResolution(env);
 const stores = await getMagasinsServerSide();
@@ -3131,7 +3173,7 @@ async function getObservationsGroupedByAR(env, stores) {
 if (!env.DB) return { byAR: {}, networkOnly: [] };
 let results;
 try {
-({ results } = await env.DB.prepare('SELECT magasin, theme, tone, texte, jour_label FROM observations ORDER BY id').all());
+results = await selectSemaineEnCours(env, 'SELECT magasin, theme, tone, texte, jour_label FROM observations WHERE created_at >= ? ORDER BY id', 'SELECT magasin, theme, tone, texte, jour_label FROM observations ORDER BY id');
 } catch(e) { return { byAR: {}, networkOnly: [] }; }
 const storeByName = new Map(stores.map(s => [normalizeName(s.libelle), s]));
 const byAR = {};
@@ -4466,7 +4508,7 @@ const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
 if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
 const today = parisTodayIso();
 let jour = url.searchParams.get('jour') || today;
-if (!/^\d{4}-\d{2}-\d{2}$/.test(jour) || jour > today || jour < addDaysIso(today, -13)) jour = today;
+if (!/^\d{4}-\d{2}-\d{2}$/.test(jour) || jour > today || jour < addDaysIso(today, -62)) jour = today;
 try {
 const stores = await getMagasinsServerSide();
 const scope = (sessionAr === 'ALL' ? stores : stores.filter(s => s.animateur === sessionAr)).filter(s => s.code);
@@ -5139,10 +5181,10 @@ const s = await request.json();
 if (!s.magasin) return jsonError('Champ magasin requis', 400, corsHeaders);
 // Statuts PEDLV recalculés avec la grille réseau (voir OBJECTIFS_RESEAU_PEDLV).
 s.indicateurs = normaliserIndicateursPedlv(s.indicateurs || {});
-await env.DB.prepare(
-`INSERT INTO store_stats (magasin, code_magasin, periode, date_extraction, ca_total, ca_opt, ca_audio, panier_moyen, taux_tc, taux_sop, taux_mdc, protheses_vendues, taux_essai, objectif, raf, prios_json, taux_test_auditif, taux_vente_add_audio, taux_pack_confort, pm_pack_confort, indicateurs_json, nb_vente_opt, jours_ouvres_mois, positionnement)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-).bind(
+await ensureRetentionColumns(env);
+const colsStoreStats = 'magasin, code_magasin, periode, date_extraction, ca_total, ca_opt, ca_audio, panier_moyen, taux_tc, taux_sop, taux_mdc, protheses_vendues, taux_essai, objectif, raf, prios_json, taux_test_auditif, taux_vente_add_audio, taux_pack_confort, pm_pack_confort, indicateurs_json, nb_vente_opt, jours_ouvres_mois, positionnement';
+const valsStoreStats = '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?';
+const bindsStoreStats = [
 s.magasin, s.codeMagasin || null, s.periode || null, s.dateExtraction || null,
 s.caTotal ?? null, s.caOpt ?? null, s.caAudio ?? null, s.panierMoyen ?? null,
 s.tauxTc ?? null, s.tauxSop ?? null, s.tauxMdc ?? null,
@@ -5152,7 +5194,13 @@ s.tauxTestAuditif ?? null, s.tauxVenteAddAudio ?? null,
 s.tauxPackConfort ?? null, s.pmPackConfort ?? null,
 JSON.stringify(s.indicateurs || {}), s.nbVenteOpt ?? null, s.joursOuvresMois ?? null,
 (s.positionnement != null && isFinite(Number(s.positionnement))) ? Number(s.positionnement) : null
-).run();
+];
+try {
+await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}, created_at) VALUES (${valsStoreStats}, datetime('now'))`).bind(...bindsStoreStats).run();
+} catch (e) {
+// Repli : colonne created_at absente (ne devrait pas arriver après ensureRetentionColumns).
+await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}) VALUES (${valsStoreStats})`).bind(...bindsStoreStats).run();
+}
 
 try {
 const periodKey = currentWeekMonday();
@@ -5926,10 +5974,18 @@ if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
 try {
 const o = await request.json();
 if (!o.m || !o.th || !o.tx || !o.t || !o.d) return jsonError('Champs requis manquants', 400, corsHeaders);
+await ensureRetentionColumns(env);
+try {
+await env.DB.prepare(
+`INSERT INTO observations (obs_id, magasin, theme, tone, texte, jour_label, date_key, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+).bind(o.id || null, o.m, o.th, o.t, o.tx, o.dl || null, o.d).run();
+} catch (e) {
 await env.DB.prepare(
 `INSERT INTO observations (obs_id, magasin, theme, tone, texte, jour_label, date_key)
 VALUES (?, ?, ?, ?, ?, ?, ?)`
 ).bind(o.id || null, o.m, o.th, o.t, o.tx, o.dl || null, o.d).run();
+}
 
 if (o.m !== 'Info générale') {
 try {
@@ -7059,7 +7115,7 @@ const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
 ctx.waitUntil(withCronAlert(env, 'Com hebdo', () => sendComHebdo(env)));
 } else if (cron === '0 20 * * SUN' || cron === '0 22 * * SUN') {
-ctx.waitUntil(withCronAlert(env, 'Purge hebdomadaire', () => purgeWeeklySources(env)));
+ctx.waitUntil(withCronAlert(env, 'Purge (données de plus de 24 mois)', () => purgeWeeklySources(env)));
 } else if (cron === '0 6 * * SUN') {
 // 29/09 : décalé du samedi au dimanche (beaucoup de magasins utilisent les
 // outils le samedi). Trigger Cloudflare à passer de "0 6 * * SAT" à "0 6 * * SUN".
