@@ -1850,6 +1850,177 @@ return set;
 function parisTodayIso() {
 return new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' });
 }
+// ---------------------------------------------------------------------------
+// Onglet « Aujourd'hui » du dashboard réseau (03/10) — activité du jour par
+// magasin, en lecture seule, sans nouvelle table ni nouveau cron. Une requête
+// groupée par source (jamais une requête par magasin), rattachement et calculs
+// faits en mémoire. Le « jour » est le jour civil de Paris : les horodatages
+// UTC (created_at, updated_at, checked_at) sont convertis avant comparaison.
+// Lancement de journée : seul outil attendu chaque jour ouvert (dimanches,
+// fériés, fériés Alsace-Moselle et fermetures réseau exclus, même calendrier
+// que le taux de lancement) — « manquant » après l'heure butoir.
+// PEDLV : store_stats_history.updated_at (dernier envoi par magasin/période),
+// donc pour un jour passé, un envoi plus récent masque celui du jour consulté.
+// Observations / PEDLV bruts purgés le dimanche soir : l'historique consultable
+// côté dashboard s'arrête au lundi de la semaine en cours.
+const LANCEMENT_HEURE_BUTOIR = '11:30';
+function activiteParseTs(ts) {
+if (!ts) return null;
+const s = String(ts);
+const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+return isNaN(d.getTime()) ? null : d;
+}
+function activiteParisDate(ts) {
+const d = activiteParseTs(ts);
+return d ? d.toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' }) : null;
+}
+function activiteParisHeure(ts) {
+const d = activiteParseTs(ts);
+return d ? d.toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit' }) : null;
+}
+// Requête tolérante : essaie d'abord avec la colonne d'horodatage, puis sans
+// (toutes les tables n'ont pas forcément de created_at). Jamais bloquant :
+// une source en erreur est simplement vide dans l'onglet.
+async function activiteQuery(env, sqls, binds) {
+for (const sql of sqls) {
+try {
+const { results } = await env.DB.prepare(sql).bind(...binds).all();
+return results || [];
+} catch (e) { /* on tente la variante suivante */ }
+}
+console.error('activite-jour : source indisponible —', sqls[sqls.length - 1]);
+return [];
+}
+async function buildActiviteJour(env, scope, jour) {
+const today = parisTodayIso();
+const maintenant = new Date().toLocaleTimeString('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', minute: '2-digit' });
+const veille = addDaysIso(jour, -1);
+const [y, m, d] = jour.split('-').map(Number);
+const jourNonPadde = y + '-' + m + '-' + d; // format date_key d'Observations Terrain
+const mois = jour.slice(0, 7);
+
+const byCode = new Map(scope.map(s => [s.code, s]));
+const byNom = new Map(scope.map(s => [normalizeName(s.libelle), s]));
+
+const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures] = await Promise.all([
+activiteQuery(env, ['SELECT magasin_code, magasin_libelle, ar, date, created_at FROM bilans WHERE date = ? OR created_at >= ?'], [jour, veille]),
+activiteQuery(env, [
+'SELECT magasin_code, rempli_par, date, created_at FROM lancements_journee WHERE date = ?',
+'SELECT magasin_code, rempli_par, date FROM lancements_journee WHERE date = ?',
+], [jour]),
+activiteQuery(env, [
+'SELECT type, magasin_code, collaborateur_nom, rempli_par, date, created_at FROM entretiens_manager WHERE date = ?',
+'SELECT type, magasin_code, collaborateur_nom, rempli_par, date FROM entretiens_manager WHERE date = ?',
+], [jour]),
+activiteQuery(env, [
+'SELECT magasin_code, tache, ar_nom, date_controle, created_at FROM notes_equipe WHERE date_controle = ?',
+'SELECT magasin_code, tache, ar_nom, date_controle FROM notes_equipe WHERE date_controle = ?',
+], [jour]),
+activiteQuery(env, [
+'SELECT magasin, theme, date_key, created_at FROM observations WHERE date_key IN (?, ?)',
+'SELECT magasin, theme, date_key FROM observations WHERE date_key IN (?, ?)',
+], [jourNonPadde, jour]),
+activiteQuery(env, ['SELECT magasin_code, items_json, score, score_max FROM kaizen_audits WHERE mois = ?'], [mois]),
+activiteQuery(env, ['SELECT magasin_key, updated_at FROM store_stats_history WHERE updated_at >= ?'], [addDaysIso(jour, -60)]),
+getFermeturesReseau(env),
+]);
+
+const fermSet = fermeturesReseauSet(fermetures);
+const feries = feriesFermesSet(y, false);
+const feriesAM = feriesFermesSet(y, true);
+const estDimanche = new Date(Date.UTC(y, m - 1, d)).getUTCDay() === 0;
+const butoirPasse = jour < today || (jour === today && maintenant >= LANCEMENT_HEURE_BUTOIR);
+
+const res = {};
+for (const s of scope) {
+const ferie = s.alsaceMoselle ? feriesAM.has(jour) : feries.has(jour);
+const attendu = !estDimanche && !ferie && !fermSet.has(jour);
+res[s.code] = {
+code: s.code, libelle: s.libelle, animateur: s.animateur || null,
+lancement: { statut: attendu ? (butoirPasse ? 'manquant' : 'attendu') : 'non_attendu', heure: null, par: null },
+bilan: null, pedlv: null, kaizen: null, entretien: null, observation: null, equipe: null,
+};
+}
+const events = [];
+const pushEvent = (store, outil, detail, par, ts, heure) => {
+const dts = activiteParseTs(ts);
+events.push({ ts: dts ? dts.toISOString() : null, heure: heure || null, code: store.code, libelle: store.libelle, animateur: store.animateur || null, outil, detail: detail || '', par: par || null });
+};
+
+for (const r of lancements) {
+const s = byCode.get(r.magasin_code); if (!s) continue;
+const L = res[s.code].lancement;
+const heure = activiteParisHeure(r.created_at);
+if (L.statut !== 'fait' || (heure && L.heure && heure < L.heure)) { L.statut = 'fait'; L.heure = heure; L.par = r.rempli_par || null; }
+pushEvent(s, 'lancement', 'Lancement de journée', r.rempli_par, r.created_at, heure);
+}
+for (const r of bilans) {
+const s = byCode.get(r.magasin_code); if (!s) continue;
+const saisiLe = activiteParisDate(r.created_at);
+if (r.date !== jour && saisiLe !== jour) continue;
+const heure = saisiLe === jour ? activiteParisHeure(r.created_at) : null;
+const B = res[s.code].bilan || (res[s.code].bilan = { nb: 0, heure: null, par: null });
+B.nb++; if (heure && (!B.heure || heure > B.heure)) B.heure = heure; B.par = r.ar || B.par;
+pushEvent(s, 'bilan', 'Bilan de passage' + (r.date !== jour ? ' (visite du ' + r.date.split('-').reverse().join('/') + ')' : ''), r.ar, saisiLe === jour ? r.created_at : null, heure);
+}
+for (const r of entretiens) {
+const s = byCode.get(r.magasin_code); if (!s) continue;
+const heure = activiteParisHeure(r.created_at);
+const E = res[s.code].entretien || (res[s.code].entretien = { nb: 0, heure: null, par: null, types: [] });
+E.nb++; if (heure && (!E.heure || heure > E.heure)) E.heure = heure; E.par = r.rempli_par || E.par;
+if (r.type && !E.types.includes(r.type)) E.types.push(r.type);
+pushEvent(s, 'entretien', r.type, r.rempli_par, r.created_at, heure);
+}
+for (const r of notes) {
+const s = byCode.get(r.magasin_code); if (!s) continue;
+const heure = activiteParisHeure(r.created_at);
+const Q = res[s.code].equipe || (res[s.code].equipe = { nb: 0, heure: null, par: null });
+Q.nb++; if (heure && (!Q.heure || heure > Q.heure)) Q.heure = heure; Q.par = r.ar_nom || Q.par;
+pushEvent(s, 'equipe', 'Évaluation équipe' + (r.tache ? ' — ' + r.tache : ''), r.ar_nom, r.created_at, heure);
+}
+for (const r of observations) {
+if (!r.magasin || r.magasin === 'Info générale') continue;
+const s = byNom.get(normalizeName(r.magasin)); if (!s) continue;
+const heure = activiteParisHeure(r.created_at);
+const O = res[s.code].observation || (res[s.code].observation = { nb: 0, heure: null });
+O.nb++; if (heure && (!O.heure || heure > O.heure)) O.heure = heure;
+pushEvent(s, 'observation', 'Observation' + (r.theme ? ' — ' + r.theme : ''), null, r.created_at, heure);
+}
+for (const r of kaizens) {
+const s = byCode.get(r.magasin_code); if (!s) continue;
+let items = {};
+try { items = JSON.parse(r.items_json || '{}'); } catch (e) {}
+let nb = 0, dernier = null, par = null;
+for (const it of Object.values(items)) {
+if (!it || !it.checked_at || activiteParisDate(it.checked_at) !== jour) continue;
+nb++;
+if (!dernier || it.checked_at > dernier) { dernier = it.checked_at; par = it.controleur || par; }
+}
+res[s.code].kaizen = { fait: nb > 0, nbItems: nb, heure: activiteParisHeure(dernier), par, score: r.score, scoreMax: r.score_max };
+if (nb > 0) pushEvent(s, 'kaizen', 'Kaizen — ' + nb + ' item' + (nb > 1 ? 's' : '') + ' contrôlé' + (nb > 1 ? 's' : ''), par, dernier, activiteParisHeure(dernier));
+}
+// PEDLV : dernier envoi connu jusqu'au jour consulté inclus.
+const dernierPedlv = {};
+for (const r of pedlvs) {
+const dj = activiteParisDate(r.updated_at);
+if (!dj || dj > jour) continue;
+if (!dernierPedlv[r.magasin_key] || r.updated_at > dernierPedlv[r.magasin_key]) dernierPedlv[r.magasin_key] = r.updated_at;
+}
+for (const s of scope) {
+const ts = dernierPedlv[normalizeName(s.libelle)];
+if (!ts) continue;
+const dj = activiteParisDate(ts);
+const joursDepuis = Math.round((Date.parse(jour + 'T00:00:00Z') - Date.parse(dj + 'T00:00:00Z')) / 86400000);
+res[s.code].pedlv = { fait: joursDepuis === 0, heure: joursDepuis === 0 ? activiteParisHeure(ts) : null, joursDepuis };
+if (joursDepuis === 0) pushEvent(s, 'pedlv', 'Pour être dans le vert', null, ts, activiteParisHeure(ts));
+}
+
+events.sort((a, b) => {
+if (a.ts && b.ts) return a.ts < b.ts ? 1 : (a.ts > b.ts ? -1 : 0);
+return a.ts ? -1 : (b.ts ? 1 : 0);
+});
+return { jour, today, maintenant, butoir: LANCEMENT_HEURE_BUTOIR, magasins: Object.values(res), events: events.slice(0, 400) };
+}
 async function getFermeturesReseau(env) {
 if (!env.DB) return [];
 try {
@@ -3493,7 +3664,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -4268,6 +4439,28 @@ return new Response(JSON.stringify({ ok: true, results }), {
 status: 200,
 headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
+}
+
+if (url.pathname === '/activite-jour') {
+// Onglet « Aujourd'hui » du dashboard réseau (03/10) — voir buildActiviteJour().
+// Même périmètre que /store-health : Olivier (ALL) voit tout le réseau, chaque
+// AR uniquement ses magasins (filtre appliqué ici, jamais côté client).
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+const today = parisTodayIso();
+let jour = url.searchParams.get('jour') || today;
+if (!/^\d{4}-\d{2}-\d{2}$/.test(jour) || jour > today || jour < addDaysIso(today, -13)) jour = today;
+try {
+const stores = await getMagasinsServerSide();
+const scope = (sessionAr === 'ALL' ? stores : stores.filter(s => s.animateur === sessionAr)).filter(s => s.code);
+const data = await buildActiviteJour(env, scope, jour);
+return new Response(JSON.stringify({ ok: true, ...data }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur activité du jour : ' + String(e), 500, corsHeaders);
+}
 }
 
 if (url.pathname === '/store-health') {
