@@ -1902,7 +1902,7 @@ const mois = jour.slice(0, 7);
 const byCode = new Map(scope.map(s => [s.code, s]));
 const byNom = new Map(scope.map(s => [normalizeName(s.libelle), s]));
 
-const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures] = await Promise.all([
+const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures, derniersBilans, dernieresEvals] = await Promise.all([
 activiteQuery(env, ['SELECT magasin_code, magasin_libelle, ar, date, created_at FROM bilans WHERE date = ? OR created_at >= ?'], [jour, veille]),
 activiteQuery(env, [
 'SELECT magasin_code, rempli_par, date, created_at FROM lancements_journee WHERE date = ?',
@@ -1923,6 +1923,10 @@ activiteQuery(env, [
 activiteQuery(env, ['SELECT magasin_code, items_json, score, score_max FROM kaizen_audits WHERE mois = ?'], [mois]),
 activiteQuery(env, ['SELECT magasin_key, updated_at FROM store_stats_history WHERE updated_at >= ?'], [addDaysIso(jour, -60)]),
 getFermeturesReseau(env),
+// Dernier bilan / dernière évaluation équipe jusqu'au jour consulté inclus
+// (03/10) : affiché « il y a N j » quand rien n'a été fait ce jour-là.
+activiteQuery(env, ['SELECT magasin_code, MAX(date) AS d FROM bilans WHERE date <= ? GROUP BY magasin_code'], [jour]),
+activiteQuery(env, ['SELECT magasin_code, MAX(date_controle) AS d FROM notes_equipe WHERE date_controle <= ? GROUP BY magasin_code'], [jour]),
 ]);
 
 const fermSet = fermeturesReseauSet(fermetures);
@@ -1939,6 +1943,7 @@ res[s.code] = {
 code: s.code, libelle: s.libelle, animateur: s.animateur || null,
 lancement: { statut: attendu ? (butoirPasse ? 'manquant' : 'attendu') : 'non_attendu', heure: null, par: null },
 bilan: null, pedlv: null, kaizen: null, entretien: null, observation: null, equipe: null,
+bilanJours: null, equipeJours: null,
 };
 }
 const events = [];
@@ -1999,6 +2004,9 @@ if (!dernier || it.checked_at > dernier) { dernier = it.checked_at; par = it.con
 res[s.code].kaizen = { fait: nb > 0, nbItems: nb, heure: activiteParisHeure(dernier), par, score: r.score, scoreMax: r.score_max };
 if (nb > 0) pushEvent(s, 'kaizen', 'Kaizen — ' + nb + ' item' + (nb > 1 ? 's' : '') + ' contrôlé' + (nb > 1 ? 's' : ''), par, dernier, activiteParisHeure(dernier));
 }
+const joursEntre = (iso) => Math.round((Date.parse(jour + 'T00:00:00Z') - Date.parse(String(iso).slice(0, 10) + 'T00:00:00Z')) / 86400000);
+for (const r of derniersBilans) { const s = byCode.get(r.magasin_code); if (s && r.d) res[s.code].bilanJours = joursEntre(r.d); }
+for (const r of dernieresEvals) { const s = byCode.get(r.magasin_code); if (s && r.d) res[s.code].equipeJours = joursEntre(r.d); }
 // PEDLV : dernier envoi connu jusqu'au jour consulté inclus.
 const dernierPedlv = {};
 for (const r of pedlvs) {
