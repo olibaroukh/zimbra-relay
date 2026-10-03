@@ -820,8 +820,23 @@ const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payloadStr));
 return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 03/10 (sécurité) : Olivier était reconnu par « le login contient baroukh »,
+// ce qui donnait aussi l'accès complet (ALL) à Vanessa Baroukh. Désormais :
+// identifiant exact uniquement (olivier.baroukh, avec ou sans domaine).
+const OLIVIER_LOGIN = 'olivier.baroukh';
+function estLoginOlivier(zimbraUser) {
+const u = String(zimbraUser || '').trim().toLowerCase();
+const local = u.split('@')[0];
+if (normalizeName(local) !== normalizeName(OLIVIER_LOGIN)) return false;
+return !u.includes('@') || u === OLIVIER_EMAIL;
+}
+// Version des jetons : les jetons « ALL » (AR) et les jetons d'accueil donnant
+// accès à Formation / Direction émis avant ce correctif sont refusés (une
+// reconnexion suffit) — ils ont pu être délivrés à tort.
+const SESSION_TOKEN_VERSION = 2;
+
 async function createArSession(ar) {
-const payload = JSON.stringify({ ar, exp: Date.now() + AR_SESSION_TTL_MS });
+const payload = JSON.stringify({ ar, exp: Date.now() + AR_SESSION_TTL_MS, v: SESSION_TOKEN_VERSION });
 const b64 = btoa(unescape(encodeURIComponent(payload)));
 const sig = await hmacSign(b64);
 return b64 + '.' + sig;
@@ -836,6 +851,7 @@ if (sig !== expectedSig) return null;
 let payload;
 try { payload = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch(e) { return null; }
 if (!payload || !payload.ar || !payload.exp || payload.exp < Date.now()) return null;
+if (payload.ar === 'ALL' && !(payload.v >= SESSION_TOKEN_VERSION)) return null;
 return payload.ar;
 }
 
@@ -956,7 +972,7 @@ _accueilTablesOk = true;
 }
 
 async function createAccueilSession(email, nom, sections) {
-const payload = JSON.stringify({ kind: 'accueil', email, nom, sections, exp: Date.now() + ACCUEIL_SESSION_TTL_MS });
+const payload = JSON.stringify({ kind: 'accueil', email, nom, sections, exp: Date.now() + ACCUEIL_SESSION_TTL_MS, v: SESSION_TOKEN_VERSION });
 const b64 = btoa(unescape(encodeURIComponent(payload)));
 const sig = await hmacSign(b64);
 return b64 + '.' + sig;
@@ -973,6 +989,8 @@ if (sig !== expectedSig) return null;
 let payload;
 try { payload = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch(e) { return null; }
 if (!payload || payload.kind !== 'accueil' || !payload.exp || payload.exp < Date.now() || !Array.isArray(payload.sections)) return null;
+// Anciens jetons (avant le 03/10) ouvrant Formation ou Direction : refusés, reconnexion demandée.
+if (!(payload.v >= SESSION_TOKEN_VERSION) && payload.sections.some(x => x === 'formation' || x === 'olivier')) return null;
 return payload;
 }
 
@@ -4334,7 +4352,7 @@ if (!zimbraToken) return jsonError('Identifiants Zimbra invalides', 401, corsHea
 const localPart = zimbraUser.split('@')[0];
 const normalizedLogin = normalizeName(localPart);
 let ar = null;
-if (normalizedLogin.includes('baroukh')) {
+if (estLoginOlivier(zimbraUser)) {
 ar = 'ALL';
 } else {
 const stores = await getMagasinsServerSide();
@@ -4406,7 +4424,7 @@ const sections = new Set(['tous']);
 // Même résolution d'identité que /ar-login (sans l'alerte mail : ici une
 // personne qui n'est pas animateur peut légitimement se connecter).
 let ar = null;
-if (normalizedLogin.includes('baroukh')) {
+if (estLoginOlivier(user)) {
 ar = 'ALL';
 } else {
 const stores = await getMagasinsServerSide();
