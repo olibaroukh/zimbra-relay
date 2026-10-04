@@ -7639,7 +7639,10 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 async scheduled(event, env, ctx) {
 chargerClesSession(env);
 await chargerObjectifsReseauPedlv();
-const cron = event.cron;
+// 04/10 : Cloudflare transmet l'expression telle qu'enregistrée dans le
+// dashboard (« 0 6 * * sun » en minuscules ce matin → aucun job déclenché).
+// Normalisation : majuscules, espaces simples.
+const cron = String(event.cron || '').trim().replace(/\s+/g, ' ').toUpperCase();
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
 ctx.waitUntil(withCronAlert(env, 'Com hebdo', () => sendComHebdo(env)));
 } else if (cron === '0 20 * * SUN' || cron === '0 22 * * SUN') {
