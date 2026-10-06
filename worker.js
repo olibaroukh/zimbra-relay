@@ -905,7 +905,10 @@ return new Response(JSON.stringify({ error: msg }), { status, headers: { 'Conten
 // page : les liens d'une section non autorisée ne quittent jamais le Worker.
 // Tables créées et pré-remplies automatiquement au premier appel (aucune
 // requête à coller dans la console D1).
-const ACCUEIL_SECTIONS = ['tous', 'animateurs', 'formation', 'olivier'];
+// 06/10 : 'direction' (Direction réseau, accès nominatifs) et 'olivier'
+// (réservée à Olivier, jamais ouvrable à quelqu'un d'autre).
+const ACCUEIL_SECTIONS = ['tous', 'animateurs', 'formation', 'direction', 'olivier'];
+const ACCUEIL_SECTIONS_NOMINATIVES = ['animateurs', 'formation', 'direction'];
 const ACCUEIL_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 j : la session ne donne accès qu'à la liste des liens
 const ACCUEIL_ICONE_MAX = 400000; // caractères (data URL ~300 Ko)
 let _accueilTablesOk = false;
@@ -968,6 +971,10 @@ stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO accueil_acces (email, section, 
 stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO accueil_meta (key, value) VALUES ('seeded', ?)`).bind(now));
 await env.DB.batch(stmts);
 }
+// 06/10 : les accès nominatifs « Direction » étaient enregistrés sous
+// 'olivier' ; ils passent sur la nouvelle section 'direction'.
+await env.DB.prepare(`UPDATE OR IGNORE accueil_acces SET section = 'direction' WHERE section = 'olivier'`).run();
+await env.DB.prepare(`DELETE FROM accueil_acces WHERE section = 'olivier'`).run();
 _accueilTablesOk = true;
 }
 
@@ -991,6 +998,11 @@ try { payload = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch(e) { 
 if (!payload || payload.kind !== 'accueil' || !payload.exp || payload.exp < Date.now() || !Array.isArray(payload.sections)) return null;
 // Anciens jetons (avant le 03/10) ouvrant Formation ou Direction : refusés, reconnexion demandée.
 if (!(payload.v >= SESSION_TOKEN_VERSION) && payload.sections.some(x => x === 'formation' || x === 'olivier')) return null;
+// 06/10 : la section 'olivier' n'appartient qu'à Olivier (un jeton émis à
+// quelqu'un d'autre la perd), et Olivier voit toujours toutes les sections,
+// y compris celles ajoutées après l'émission de son jeton.
+if (estLoginOlivier(payload.email)) payload.sections = ACCUEIL_SECTIONS.slice();
+else payload.sections = payload.sections.filter(x => x !== 'olivier' && ACCUEIL_SECTIONS.includes(x));
 return payload;
 }
 
@@ -4438,7 +4450,7 @@ ar = uniqueARs.find(a => normalizeName(a) === normalizedLogin) || null;
 if (ar === 'ALL') ACCUEIL_SECTIONS.forEach(s => sections.add(s));
 else if (ar) sections.add('animateurs');
 const { results: acces } = await env.DB.prepare(`SELECT section FROM accueil_acces WHERE lower(email) = ?`).bind(emailLower).all();
-for (const a of (acces || [])) if (ACCUEIL_SECTIONS.includes(a.section)) sections.add(a.section);
+for (const a of (acces || [])) if (ACCUEIL_SECTIONS_NOMINATIVES.includes(a.section)) sections.add(a.section);
 
 const sectionsList = ACCUEIL_SECTIONS.filter(s => sections.has(s));
 const token = await createAccueilSession(emailLower, nom, sectionsList);
@@ -4508,7 +4520,7 @@ await env.DB.prepare(`DELETE FROM accueil_apps WHERE id = ?`).bind(parseInt(body
 const email = String(body.email || '').trim().toLowerCase();
 const section = String(body.section || '');
 if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return jsonError('Adresse email invalide', 400, corsHeaders);
-if (!['animateurs', 'formation', 'olivier'].includes(section)) return jsonError('Section inconnue', 400, corsHeaders);
+if (!ACCUEIL_SECTIONS_NOMINATIVES.includes(section)) return jsonError(section === 'olivier' ? 'La section Olivier vous est réservée' : 'Section inconnue', 400, corsHeaders);
 await env.DB.prepare(`INSERT OR IGNORE INTO accueil_acces (email, section, created_at) VALUES (?, ?, ?)`).bind(email, section, now).run();
 } else if (body.action === 'acces-delete') {
 await env.DB.prepare(`DELETE FROM accueil_acces WHERE id = ?`).bind(parseInt(body.id, 10)).run();
