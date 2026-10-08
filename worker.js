@@ -2189,9 +2189,10 @@ SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) AS eff_ld,
 SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
 FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
 WHERE es.site_reconnu = 1 AND es.mois >= ? AND es.mois <= ? GROUP BY es.mois, es.code_site`, santeMoisDecale(mois, -6), mois),
-q(`SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule
+q(`SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule, em.poste AS poste, em.prenom AS prenom, em.nom AS nom, a.longue_duree AS longue_duree
 FROM rh_effectif_site_mensuel es JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
-WHERE es.site_reconnu = 1 AND (em.poste IS NULL OR em.poste != 'Manager')
+LEFT JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
+WHERE es.site_reconnu = 1
 AND es.mois = (SELECT MAX(mois) FROM rh_effectif_site_mensuel WHERE mois <= ?)`, mois),
 q(`SELECT DISTINCT magasin_code, collaborateur_matricule FROM entretiens_manager
 WHERE date >= ? AND date <= ? AND type IN (${TYPES_ENTRETIENS_COMPTES.map(() => '?').join(',')}) AND collaborateur_matricule IS NOT NULL`,
@@ -2221,7 +2222,8 @@ rhRows.forEach(r => { (rh[r.code_site] ??= {})[r.mois] = { effectifDispo: (r.eff
 const rhMoisEligibles = rhElig.length ? rhElig[0].mois : null;
 const rhImportPresent = rhRows.some(r => r.mois === mois);
 const motifRhAbsent = rhImportPresent ? 'Aucun salarié rattaché à ce magasin dans l\'import RH du mois' : 'Import RH du mois absent';
-const eligibles = {}; rhElig.forEach(r => { (eligibles[r.code_site] ??= new Set()).add(r.matricule); });
+const eligibles = rhEligiblesParMagasin(rhElig, stores); // hors manager (08/10)
+const absBilan = await getAbsencesLdBilans(env, mois);
 const vus = {}; entretiens.forEach(r => { (vus[r.magasin_code] ??= new Set()).add(r.collaborateur_matricule); });
 const lancParCode = {}; lancements.forEach(r => { lancParCode[r.magasin_code] = r.jours; });
 const kaizenParCode = {}; kaizens.forEach(r => { kaizenParCode[r.magasin_code] = r; });
@@ -2338,15 +2340,20 @@ if (k && k.score_max) { sous.kaizen = Math.max(0, Math.min(100, (k.score / k.sco
 else { sous.kaizen = 0; entrees.kaizen = null; }
 if (!store.concept) propositions.push({ dimension: 'kaizen', motif: 'Magasin non éligible Kaizen (concept non renseigné)' });
 
-// Entretiens : collaborateurs éligibles (RH du mois, hors managers) vus dans le mois.
+// Entretiens : collaborateurs RH du mois (hors manager), moins les absences
+// longue durée (bilan de passage, sinon RH), vus dans le mois (08/10).
 if (!rhMoisEligibles) { sous.entretiens = null; exclusions.entretiens = 'Aucun import RH disponible'; }
 else {
-const elig = eligibles[code] || new Set();
+const eg = eligibles[code];
+const elig = eg ? eg.eligibles : new Set();
+const att = entretiensAttendus(eg, absBilan[code]);
 if (!elig.size) { sous.entretiens = null; exclusions.entretiens = 'Aucun collaborateur éligible (RH ' + rhMoisEligibles + ')'; }
+else if (!att.attendus) { sous.entretiens = null; exclusions.entretiens = 'Tout l\'effectif est en absence longue durée (' + att.absLd + ')'; }
 else {
 const v = vus[code] || new Set(); let n = 0; elig.forEach(m => { if (v.has(m)) n++; });
-sous.entretiens = Math.round((n / elig.size) * 100);
-entrees.entretiens = { eligibles: elig.size, vus: n, rhMois: rhMoisEligibles };
+n = Math.min(n, att.attendus);
+sous.entretiens = Math.round((n / att.attendus) * 100);
+entrees.entretiens = { eligibles: att.attendus, effectifHorsManager: att.effectif, absencesLongueDuree: att.absLd, sourceAbsences: att.source, vus: n, rhMois: rhMoisEligibles };
 }
 }
 
@@ -2672,10 +2679,80 @@ return hier > 0 ? hier : compterJoursAttendus(mois, alsaceMoselle, fermSet, toda
 // calculer le mois écoulé (sans lui, le 1er renvoyait le mois qui commence).
 // Types d'entretien qui comptent dans la couverture « entretiens individuels »
 // (26/09, Suivi Managers v2) — UNE seule liste, lue par le score de santé, le
-// tableau du récap mensuel et la jauge hebdo. Recadrage toujours hors calcul.
+// tableau du récap mensuel et la jauge hebdo. Recadrage compté depuis le
+// 08/10 (décision Olivier : un recadrage vaut un entretien de pilotage fait).
 // Écoute & Feedback volontairement absente (règle du 18/09 maintenue le 26/09,
 // à rediscuter avec les équipes terrain) : pour l'inclure, ajouter 'ecoute_fb'.
-const TYPES_ENTRETIENS_COMPTES = ['pilotage_optique', 'pilotage_audio', 'valorisation', 'remotivation'];
+const TYPES_ENTRETIENS_COMPTES = ['pilotage_optique', 'pilotage_audio', 'recadrage', 'valorisation', 'remotivation'];
+
+// ── Entretiens attendus (08/10) ─────────────────────────────────────────────
+// Attendus du mois = collaborateurs RH du magasin, HORS manager (il ne se fait
+// pas son propre entretien), MOINS le nombre d'absences longue durée.
+// Manager : poste RH « Manager » (insensible à la casse). Si aucun salarié du
+// magasin n'a ce poste dans l'import, repli sur le nom de la colonne `manager`
+// de magasins.csv (prénom nom, dans un sens ou dans l'autre).
+// Absences longue durée : case du bilan de passage (pré-remplie depuis l'import
+// RH, modifiable par l'AR) — dernier bilan daté entre le 1er du mois précédent
+// et la fin du mois ; à défaut, décompte RH (longue_duree = 1, hors manager).
+function rhEstPosteManager(poste) {
+return String(poste || '').trim().toLowerCase() === 'manager';
+}
+function rhCorrespondNomManager(store, prenom, nom) {
+const cible = normalizeName(store && store.manager);
+if (!cible) return false;
+return normalizeName(`${prenom || ''} ${nom || ''}`) === cible || normalizeName(`${nom || ''} ${prenom || ''}`) === cible;
+}
+// rows : [{ code_site, matricule, poste, prenom, nom, longue_duree }] (un mois RH).
+// Renvoie { [code]: { eligibles: Set(matricules hors manager), ldRh: nb d'éligibles en longue durée } }.
+function rhEligiblesParMagasin(rows, stores) {
+const storesByCode = new Map((stores || []).map(st => [st.code, st]));
+const parCode = {};
+(rows || []).forEach(r => { (parCode[r.code_site] ??= []).push(r); });
+const out = {};
+for (const [code, lignes] of Object.entries(parCode)) {
+const aUnPosteManager = lignes.some(r => rhEstPosteManager(r.poste));
+const store = storesByCode.get(code);
+const eligibles = new Set(); const ld = new Set();
+lignes.forEach(r => {
+if (rhEstPosteManager(r.poste)) return;
+if (!aUnPosteManager && rhCorrespondNomManager(store, r.prenom, r.nom)) return;
+eligibles.add(r.matricule);
+if (Number(r.longue_duree) === 1) ld.add(r.matricule);
+});
+out[code] = { eligibles, ldRh: ld.size };
+}
+return out;
+}
+// Absences longue durée saisies dans le bilan de passage pour le mois `mois`.
+// Renvoie { [code]: { n, date } } (seulement les magasins où la case est remplie).
+async function getAbsencesLdBilans(env, mois) {
+const debut = santeMoisDecale(mois, -1) + '-01';
+const fin = santeFinMois(mois);
+let rows = [];
+try {
+({ results: rows } = await env.DB.prepare(
+`SELECT magasin_code, date, abs_ld FROM (
+SELECT magasin_code, date, json_extract(data_json, '$.magasin.abs_ld') AS abs_ld,
+ROW_NUMBER() OVER (PARTITION BY magasin_code ORDER BY date DESC, id DESC) AS rn
+FROM bilans WHERE date >= ? AND date <= ?
+AND json_extract(data_json, '$.magasin.abs_ld') IS NOT NULL AND json_extract(data_json, '$.magasin.abs_ld') != ''
+) WHERE rn = 1`
+).bind(debut, fin).all());
+} catch (e) { console.error('Lecture absences longue durée (bilans) :', e); }
+const out = {};
+(rows || []).forEach(r => {
+const n = parseInt(String(r.abs_ld).replace(',', '.'), 10);
+if (Number.isFinite(n) && n >= 0) out[r.magasin_code] = { n, date: r.date };
+});
+return out;
+}
+// Calcul commun des attendus pour un magasin.
+function entretiensAttendus(elig, absBilan) {
+const effectif = elig ? elig.eligibles.size : 0;
+const absLd = absBilan ? absBilan.n : (elig ? elig.ldRh : 0);
+const source = absBilan ? 'bilan' : 'rh';
+return { effectif, absLd, source, attendus: Math.max(0, effectif - absLd) };
+}
 
 async function getEntretiensLancementsMap(env, moisCible) {
 if (!env.DB) return {};
@@ -2684,20 +2761,20 @@ const moisActuel = moisCible || parisTodayIso().slice(0, 7);
 let eligibleRows = [];
 try {
 ({ results: eligibleRows } = await env.DB.prepare(
-`SELECT es.code_site, es.matricule
+`SELECT es.code_site, es.matricule, em.poste, em.prenom, em.nom, a.longue_duree
 FROM rh_effectif_site_mensuel es
 JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
+LEFT JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
 INNER JOIN (
 SELECT code_site, MAX(mois) as maxmois FROM rh_effectif_site_mensuel WHERE site_reconnu = 1 GROUP BY code_site
 ) latest ON latest.code_site = es.code_site AND latest.maxmois = es.mois
-WHERE es.site_reconnu = 1 AND (em.poste IS NULL OR em.poste != 'Manager')`
+WHERE es.site_reconnu = 1`
 ).all());
 } catch (e) {}
 
-const eligiblesParMagasin = {};
-eligibleRows.forEach(r => {
-(eligiblesParMagasin[r.code_site] = eligiblesParMagasin[r.code_site] || new Set()).add(r.matricule);
-});
+const storesRef = await getMagasinsServerSide();
+const eligiblesParMagasin = rhEligiblesParMagasin(eligibleRows, storesRef);
+const absBilanParMagasin = await getAbsencesLdBilans(env, moisActuel);
 
 let entretienRows = [];
 try {
@@ -2715,7 +2792,7 @@ entretienRows.forEach(r => {
 
 // Jours attendus par magasin (26/09) — calendrier réseau commun, seule
 // différence possible entre magasins : l'Alsace-Moselle (2 fériés de plus).
-const stores = await getMagasinsServerSide();
+const stores = storesRef;
 const fermSet = fermeturesReseauSet(await getFermeturesReseau(env));
 const joursAttendusStd = joursAttendusLancement(moisActuel, false, fermSet);
 const joursAttendusAM = joursAttendusLancement(moisActuel, true, fermSet);
@@ -2754,25 +2831,31 @@ const allCodes = new Set([
 ...Object.keys(typeCountsParMagasin),
 ]);
 allCodes.forEach(code => {
-const eligibles = eligiblesParMagasin[code] || new Set();
+const elig = eligiblesParMagasin[code];
+const eligibles = elig ? elig.eligibles : new Set();
+const att = entretiensAttendus(elig, absBilanParMagasin[code]);
 const vus = vusParMagasin[code] || new Set();
-let nbVus = 0;
-eligibles.forEach(m => { if (vus.has(m)) nbVus++; });
-const tauxEntretiens = eligibles.size > 0 ? Math.round((nbVus / eligibles.size) * 100) : 0;
+let nbVusBrut = 0;
+eligibles.forEach(m => { if (vus.has(m)) nbVusBrut++; });
+// Un collaborateur en longue durée vu quand même ne fait pas dépasser 100 %.
+const nbVus = Math.min(nbVusBrut, att.attendus);
+// Tout l'effectif en longue durée : rien d'attendu, donc rien de manquant.
+const tauxEntretiens = att.attendus > 0 ? Math.round((nbVus / att.attendus) * 100) : (att.effectif > 0 ? 100 : 0);
 
 const joursOuverts = joursOuvertsParMagasin[code];
 const joursLances = lancementsParMagasin[code] || 0;
 const tauxLancements = joursOuverts ? Math.min(100, Math.round((joursLances / joursOuverts) * 100)) : 0;
 
 const tc = typeCountsParMagasin[code] || {};
-const nbPilotage = (tc.pilotage_optique || 0) + (tc.pilotage_audio || 0);
+const nbPilotage = (tc.pilotage_optique || 0) + (tc.pilotage_audio || 0) + (tc.recadrage || 0); // recadrage compté (08/10)
 const nbEcouteFb = tc.ecoute_fb || 0;
 const nbRecadrage = tc.recadrage || 0;
 const nbValorisation = tc.valorisation || 0;
 const nbRemotivation = tc.remotivation || 0;
 
 map[code] = {
-tauxEntretiens, nbEligibles: eligibles.size, nbVus,
+// nbEligibles = entretiens ATTENDUS (hors manager, absences longue durée déduites).
+tauxEntretiens, nbEligibles: att.attendus, nbVus, nbEffectif: att.effectif, nbAbsencesLd: att.absLd, sourceAbsencesLd: att.source,
 tauxLancements, joursOuverts: joursOuverts || 0, joursLances,
 nbPilotage, nbEcouteFb, nbRecadrage, nbValorisation, nbRemotivation, nbLancements: joursLances,
 };
@@ -3441,8 +3524,9 @@ return { subject, from, to, byAR, arStats, byArBullets, weeklyRowsCount: weeklyR
 
 // Tableau taux entretiens / lancements par magasin (phase 3, 18/09 — révisé
 // le 18/09 pour exclure Écoute&FB) — types comptés : TYPES_ENTRETIENS_COMPTES
-// (pilotage optique/audio, valorisation, remotivation depuis le 26/09) ;
-// recadrage et écoute_fb exclus, un magasin sans donnée à 0%.
+// (pilotage optique/audio, valorisation, remotivation depuis le 26/09,
+// recadrage depuis le 08/10) ; écoute_fb exclu, un magasin sans donnée à 0%.
+// Dénominateur = entretiens attendus (hors manager, absences longue durée déduites).
 function htmlEntretiensLancementsTable(stores, map, moisLabel) {
 const rows = stores.map(s => {
 const d = map[s.code] || { tauxLancements: 0, tauxEntretiens: 0, nbVus: 0, nbEligibles: 0 };
@@ -6090,6 +6174,22 @@ if (url.pathname === '/rh-effectif') {
       const val = Math.round(r.total * 10) / 10;
       if (r.poste_categorie === 'opticien') magasins[r.code_site].eff_opt = val;
       if (r.poste_categorie === 'audio') magasins[r.code_site].eff_audio = val;
+    }
+
+    // 08/10 : absences longue durée du magasin (hors manager) — pré-remplit la
+    // case du bilan de passage, déduite ensuite des entretiens attendus.
+    if (magasinCode) {
+      try {
+        const { results: ldRows } = await env.DB.prepare(
+          `SELECT es.code_site, es.matricule, em.poste, em.prenom, em.nom, a.longue_duree
+           FROM rh_effectif_site_mensuel es
+           JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
+           LEFT JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
+           WHERE es.mois = ? AND es.site_reconnu = 1 AND es.code_site = ?`
+        ).bind(dernierMois, magasinCode).all();
+        const elig = rhEligiblesParMagasin(ldRows, await getMagasinsServerSide())[magasinCode];
+        if (elig) (magasins[magasinCode] ??= { eff_opt: 0, eff_audio: 0 }).abs_ld = elig.ldRh;
+      } catch (e) { console.error('Absences longue durée (rh-effectif) :', e); }
     }
 
     if (nomsRaw) {
