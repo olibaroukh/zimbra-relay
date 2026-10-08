@@ -4383,21 +4383,47 @@ ar = uniqueARs.find(a => normalizeName(a) === normalizedLogin) || null;
 }
 }
 if (!ar) {
-// Le mot de passe Zimbra vient d'être vérifié pour de vrai juste au-dessus —
-// donc ce n'est jamais un inconnu qui déclenche cette alerte, seulement la
-// résolution d'identité qui échoue. On prévient Olivier pour qu'il puisse
-// corriger magasins.csv sans attendre que l'AR le lui signale lui-même.
-// `fetch(request, env)` n'a pas de `ctx` ici (pas de waitUntil disponible) —
-// on attend l'envoi avant de répondre, léger surcoût acceptable sur ce
-// chemin d'erreur rare.
+// 08/10 : identifiants Zimbra valides mais personne d'autorisé derrière.
+// Deux cas, chacun avec un message lisible pour la personne qui essaie :
+//  1. Boîte mail d'un MAGASIN (colonne `email` de magasins.csv, ex.
+//     colomiers@) : cas normal, pas une erreur de référentiel → aucun mail
+//     à Olivier (c'était la source des alertes répétées plusieurs fois par jour).
+//  2. Compte personnel non référencé comme AR : peut être un vrai oubli dans
+//     magasins.csv → alerte à Olivier, mais au plus une fois par 24 h et par
+//     identifiant (table D1 `ar_login_alertes` ; le Cache API ne fonctionne pas
+//     sur *.workers.dev).
+const loginNorm = (zimbraUser || '').trim().toLowerCase();
+const storesRef = await getMagasinsServerSide().catch(() => []);
+const magasinCompte = storesRef.find(s => s.email && s.email.trim().toLowerCase() === loginNorm);
+if (magasinCompte) {
+return new Response(JSON.stringify({
+error: `Accès réservé aux animateurs régionaux. « ${zimbraUser} » est la boîte mail du magasin ${magasinCompte.libelle || ''}. Cet espace n'est pas ouvert aux comptes magasin : connecte-toi avec ton identifiant Zimbra personnel (prenom.nom@optical-center.com) si tu es animateur.`,
+code: 'COMPTE_MAGASIN'
+}), { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
+let doitAlerter = true;
+try {
+await env.DB.prepare(`CREATE TABLE IF NOT EXISTS ar_login_alertes (login TEXT PRIMARY KEY, last_at INTEGER NOT NULL)`).run();
+const last = await env.DB.prepare(`SELECT last_at FROM ar_login_alertes WHERE login = ?`).bind(loginNorm).first();
+if (last && (Date.now() - last.last_at) < 24 * 60 * 60 * 1000) doitAlerter = false;
+} catch (e) { console.error('Anti-doublon alerte ar-login indisponible:', e); }
+if (doitAlerter) {
+// `fetch(request, env)` n'a pas de `ctx` ici (pas de waitUntil) — on attend
+// l'envoi avant de répondre, surcoût acceptable sur ce chemin rare.
 try {
 await zimbraSendMail(env, {
 to: OLIVIER_EMAIL,
-subject: `⚠️ Connexion Analyse échouée — aucun AR ne correspond`,
-bodyText: `Identifiants Zimbra valides pour "${zimbraUser}", mais aucun animateur ne correspond dans magasins.csv (ni par email, ni par nom).\n\nÀ corriger dans magasins.csv : vérifier que la colonne "animateur_email" contient bien "${zimbraUser}" pour cette personne, ou à défaut que la colonne "animateur" suit le motif prenom.nom attendu (login testé : "${normalizedLogin}").`,
+subject: `⚠️ Connexion refusée — aucun AR ne correspond`,
+bodyText: `Identifiants Zimbra valides pour "${zimbraUser}", mais aucun animateur ne correspond dans magasins.csv (ni par email, ni par nom). L'accès a été refusé et la personne a vu un message « accès réservé aux animateurs ».\n\nSi cette personne doit avoir accès : vérifier que la colonne "animateur_email" de magasins.csv contient bien "${zimbraUser}", ou à défaut que la colonne "animateur" suit le motif prenom.nom (login testé : "${normalizedLogin}").\n\n(Une seule alerte par identifiant et par 24 h.)`,
 });
+await env.DB.prepare(`INSERT INTO ar_login_alertes (login, last_at) VALUES (?, ?) ON CONFLICT(login) DO UPDATE SET last_at = excluded.last_at`).bind(loginNorm, Date.now()).run();
 } catch (e) { console.error('Échec envoi alerte ar-login:', e); }
-return jsonError("Identifiants valides mais aucun animateur ne correspond à '" + zimbraUser + "' dans le référentiel magasins. Vérifie la colonne animateur_email (ou à défaut animateur) dans magasins.csv.", 403, corsHeaders);
+}
+return new Response(JSON.stringify({
+error: `Accès non autorisé. Ton identifiant « ${zimbraUser} » est valide, mais cet espace est réservé aux animateurs régionaux et ton compte n'y est pas rattaché. Si tu penses que c'est une erreur, contacte Olivier Baroukh.`,
+code: 'NON_AUTORISE'
+}), { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 }
 
 const sessionToken = await createArSession(ar);
