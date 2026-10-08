@@ -116,6 +116,7 @@ const RH_MALADIE_AT_COLS = [
 
 // Pour la règle "longue durée" : maternité/parental/paternité déclenche direct.
 const RH_MATERNITE_PARENTAL_COLS = ['Congé maternité', 'Congé paternité', 'Congé Parental'];
+const RH_LD_MATERNITE_PARENTAL_MIN_JOURS = 15; // seuil validé par Olivier le 08/10
 
 function rhSommeColonnes(row, cols) {
   return cols.reduce((acc, c) => acc + rhNum(row[c]), 0);
@@ -6081,7 +6082,10 @@ if (url.pathname === '/rh-import/agenda') {
       const joursOuvresTheoriques = joursCalendaires - reposHebdo - feries - fermeture;
 
       let longueDuree = 0;
-      if (maternitéParentalJours > 0) {
+      // 08/10 : maternité/paternité/parental = longue durée seulement à partir
+      // de RH_LD_MATERNITE_PARENTAL_MIN_JOURS jours dans le mois (avant : dès
+      // 1 jour — cas Claye-Souilly, 2 jours de parental comptés en longue durée).
+      if (maternitéParentalJours >= RH_LD_MATERNITE_PARENTAL_MIN_JOURS) {
         longueDuree = 1;
       } else if (maladieAtJours > 0 && (maladieAtMoisPrecedent.get(matricule) || 0) > 0) {
         longueDuree = 1;
