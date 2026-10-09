@@ -6242,6 +6242,19 @@ const stores = await getMagasinsServerSide();
 const magasin = stores.find(s => String(s.code) === String(magasinCode)) || null;
 const animateur = magasin ? magasin.animateur : null;
 
+// 09/10 (anti-doublons) : même magasin + même date + même type + même
+// collaborateur déjà enregistré → on ne crée rien (ni ligne, ni suivis, ni
+// mail) et on renvoie l'existant. Même clé que le repérage « doublon
+// probable » de l'Historique. Sans collaborateur, pas de contrôle.
+const cleCollab = String(collaborateurMatricule || collaborateurNom || '').trim();
+if (cleCollab) {
+const existant = await env.DB.prepare(
+`SELECT id FROM entretiens_manager WHERE CAST(COALESCE(magasin_code, '') AS TEXT) = ? AND date = ? AND type = ?
+AND COALESCE(NULLIF(collaborateur_matricule, ''), collaborateur_nom, '') = ? LIMIT 1`
+).bind(String(magasinCode || ''), date, type, cleCollab).first();
+if (existant) return new Response(JSON.stringify({ ok: true, id: existant.id, deja: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
 const insert = await env.DB.prepare(
 `INSERT INTO entretiens_manager
 (type, magasin_code, magasin_libelle, animateur, collaborateur_matricule, collaborateur_nom, rempli_par, date, data_json)
@@ -6362,6 +6375,12 @@ if (!remplipar || !posteRemplipar || !date) return jsonError('Champs manquants',
 const stores = await getMagasinsServerSide();
 const magasin = stores.find(s => String(s.code) === String(magasinCode)) || null;
 const animateur = magasin ? magasin.animateur : null;
+
+// 09/10 (anti-doublons) : un seul lancement par magasin et par jour.
+const existantL = await env.DB.prepare(
+`SELECT id FROM lancements_journee WHERE CAST(COALESCE(magasin_code, '') AS TEXT) = ? AND date = ? LIMIT 1`
+).bind(String(magasinCode || ''), date).first();
+if (existantL) return new Response(JSON.stringify({ ok: true, id: existantL.id, deja: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 await env.DB.prepare(
 `INSERT INTO lancements_journee
