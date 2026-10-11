@@ -1176,11 +1176,54 @@ const { results } = await env.DB.prepare(sqlRepli).all();
 return results || [];
 }
 }
+// ---------- Archives des rapports PEDLV (11/10) ----------
+// Base D1 séparée « rapports-archives » (binding ARCHIVES) pour ne pas faire
+// grossir bilan-passage-db (plafond de 500 Mo par base sur le plan gratuit,
+// 5 Go par compte). La table est créée automatiquement au premier usage.
+// Un rapport par magasin et par date d'extraction : une nouvelle génération
+// remplace la précédente. Conservation 24 mois (purge du dimanche 20h).
+// Le contenu est l'instantané HTML du rapport tel qu'affiché (cartes
+// prioritaires comprises), scripts retirés, compressé en gzip puis base64.
+let _archivesTableOk = false;
+async function ensureArchivesTable(env) {
+if (_archivesTableOk || !env.ARCHIVES) return;
+await env.ARCHIVES.prepare(`CREATE TABLE IF NOT EXISTS pedlv_rapports (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+magasin TEXT NOT NULL,
+magasin_key TEXT NOT NULL,
+code_magasin TEXT,
+periode TEXT,
+date_extraction TEXT,
+animateur TEXT,
+lang TEXT,
+encodage TEXT NOT NULL,
+taille_html INTEGER,
+contenu TEXT NOT NULL,
+created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`).run();
+await env.ARCHIVES.prepare('CREATE INDEX IF NOT EXISTS idx_pedlv_rapports_code ON pedlv_rapports(code_magasin)').run();
+await env.ARCHIVES.prepare('CREATE INDEX IF NOT EXISTS idx_pedlv_rapports_key ON pedlv_rapports(magasin_key, date_extraction)').run();
+_archivesTableOk = true;
+}
+
+async function decoderArchivePedlv(encodage, contenu) {
+if (encodage !== 'gzip-b64') return contenu;
+const bin = atob(contenu);
+const bytes = new Uint8Array(bin.length);
+for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+return await new Response(stream).text();
+}
+// ---------- Fin helpers archives PEDLV ----------
+
 async function purgeWeeklySources(env) {
 await ensureRetentionColumns(env);
 const limite = `-${RETENTION_MOIS} months`;
 try { await env.DB.prepare(`DELETE FROM observations WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge observations (> 24 mois) échouée:', e); }
 try { await env.DB.prepare(`DELETE FROM store_stats WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge store_stats (> 24 mois) échouée:', e); }
+if (env.ARCHIVES) {
+try { await ensureArchivesTable(env); await env.ARCHIVES.prepare(`DELETE FROM pedlv_rapports WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge archives PEDLV (> 24 mois) échouée:', e); }
+}
 }
 
 // 29/09 : semaine du lundi au SAMEDI (avant : lundi-vendredi, les bilans du
@@ -4339,7 +4382,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -5921,6 +5964,85 @@ status: 200,
 headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
 }
+
+// ---------- Archives des rapports PEDLV (11/10) — routes ----------
+// POST /pedlv-archive        : dépôt d'un rapport magasin (X-Store-Token)
+// GET  /pedlv-archives       : liste (session AR : ses magasins ; ALL : tout)
+// GET  /pedlv-archive-get?id : HTML du rapport, décompressé
+if (url.pathname === '/pedlv-archive' && request.method === 'POST') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.ARCHIVES) return jsonError("Base d'archives non liée au Worker (binding ARCHIVES)", 503, corsHeaders);
+let b; try { b = await request.json(); } catch (e) { return jsonError('JSON invalide', 400, corsHeaders); }
+if (!b?.magasin || typeof b.contenu !== 'string' || !b.contenu) return jsonError('Champs magasin et contenu requis', 400, corsHeaders);
+if (b.contenu.length > 1800000) return jsonError('Rapport trop volumineux pour être archivé', 413, corsHeaders);
+const encodage = b.encodage === 'gzip-b64' ? 'gzip-b64' : 'html';
+const aliasResolution = await getStoreStatsAliasResolution(env);
+const stores = await getMagasinsServerSide();
+const storesByCode = new Map(stores.map(st => [st.code, st]));
+const magasinKey = resolveStoreStatsKey({ magasin: b.magasin, code_magasin: b.codeMagasin }, aliasResolution, storesByCode);
+const store = stores.find(st => normalizeName(st.libelle) === magasinKey);
+const code = store ? store.code : (b.codeMagasin ? String(b.codeMagasin).trim() : null);
+const dateEx = b.dateExtraction ? String(b.dateExtraction).slice(0, 40) : null;
+await ensureArchivesTable(env);
+await env.ARCHIVES.batch([
+env.ARCHIVES.prepare('DELETE FROM pedlv_rapports WHERE magasin_key = ? AND date_extraction IS ?').bind(magasinKey, dateEx),
+env.ARCHIVES.prepare(
+`INSERT INTO pedlv_rapports (magasin, magasin_key, code_magasin, periode, date_extraction, animateur, lang, encodage, taille_html, contenu)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+).bind(
+store ? store.libelle : String(b.magasin).slice(0, 120), magasinKey, code,
+b.periode ? String(b.periode).slice(0, 60) : null, dateEx,
+b.animateur ? String(b.animateur).slice(0, 120) : null,
+b.lang ? String(b.lang).slice(0, 5) : null,
+encodage, Number.isFinite(b.tailleHtml) ? b.tailleHtml : null, b.contenu
+)
+]);
+return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
+if (url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.ARCHIVES) return jsonError("L'archivage des rapports n'est pas encore activé (base d'archives non liée).", 503, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+let allowedCodes = null;
+if (sessionAr !== 'ALL') {
+const stores = await getMagasinsServerSide();
+allowedCodes = stores.filter(s => s.animateur === sessionAr).map(s => s.code);
+}
+await ensureArchivesTable(env);
+
+if (url.pathname === '/pedlv-archives') {
+let query = 'SELECT id, magasin, code_magasin, periode, date_extraction, animateur, taille_html, created_at FROM pedlv_rapports WHERE 1=1';
+const binds = [];
+const codeFiltre = url.searchParams.get('code');
+if (codeFiltre) {
+if (allowedCodes && !allowedCodes.includes(codeFiltre)) return jsonError('Accès non autorisé à ce magasin', 403, corsHeaders);
+query += ' AND code_magasin = ?'; binds.push(codeFiltre);
+} else if (allowedCodes) {
+if (!allowedCodes.length) return new Response(JSON.stringify({ ok: true, ar: sessionAr, results: [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+query += ' AND code_magasin IN (' + allowedCodes.map(() => '?').join(',') + ')';
+binds.push(...allowedCodes);
+}
+query += ' ORDER BY created_at DESC, id DESC LIMIT ?';
+binds.push(Math.min(parseInt(url.searchParams.get('limit') || '500'), 1000));
+const { results } = await env.ARCHIVES.prepare(query).bind(...binds).all();
+return new Response(JSON.stringify({ ok: true, ar: sessionAr, results: results || [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
+const id = parseInt(url.searchParams.get('id') || '');
+if (!id) return jsonError('Paramètre id requis', 400, corsHeaders);
+const row = await env.ARCHIVES.prepare('SELECT id, magasin, code_magasin, date_extraction, encodage, contenu FROM pedlv_rapports WHERE id = ?').bind(id).first();
+if (!row) return jsonError('Rapport introuvable', 404, corsHeaders);
+if (allowedCodes && !allowedCodes.includes(row.code_magasin)) return jsonError('Accès non autorisé à ce magasin', 403, corsHeaders);
+let html;
+try { html = await decoderArchivePedlv(row.encodage, row.contenu); }
+catch (e) { return jsonError('Rapport archivé illisible : ' + String(e), 500, corsHeaders); }
+return new Response(JSON.stringify({ ok: true, id: row.id, magasin: row.magasin, dateExtraction: row.date_extraction, html }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+// ---------- Fin archives PEDLV — routes ----------
 
 if (url.pathname === '/store-stats') {
 const storeToken = request.headers.get('X-Store-Token');
