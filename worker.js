@@ -4339,7 +4339,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -5099,6 +5099,16 @@ return jsonError('Erreur lecture dernier bilan : ' + String(e), 500, corsHeaders
 }
 }
 
+// ---------- Historique des bilans (11/10) ----------
+// /bilans : liste filtrée par session AR (chaque AR ne voit que ses magasins,
+// ALL voit tout le réseau). Paramètres :
+//   magasin_code   un seul magasin
+//   magasin_codes  liste séparée par des virgules (intersectée avec le périmètre)
+//   light=1        data_json SANS les photos (liste d'historique, payload léger)
+//   from / to / limit
+// /bilan-get?id= : un bilan complet (photos comprises) pour régénérer le PDF.
+// /import-bilans-local (POST) : remontée des bilans restés sur l'appareil,
+// avec anti-doublon (magasin_code + date + passage).
 if (url.pathname === '/bilans') {
 const storeToken = request.headers.get('X-Store-Token');
 if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
@@ -5117,22 +5127,33 @@ const magasinCode = url.searchParams.get('magasin_code');
 if (magasinCode && allowedCodes && !allowedCodes.includes(magasinCode)) {
 return jsonError('Accès non autorisé à ce magasin', 403, corsHeaders);
 }
+const codesParam = (url.searchParams.get('magasin_codes') || '').split(',').map(s => s.trim()).filter(Boolean);
+const light = url.searchParams.get('light') === '1';
 const from = url.searchParams.get('from');
 const to = url.searchParams.get('to');
 const limit = Math.min(parseInt(url.searchParams.get('limit') || '200'), 1000);
 
-let query = 'SELECT id, magasin_code, magasin_libelle, ar, date, passage, humeur, ca_mensuel, ca_annuel, renta, data_json, created_at FROM bilans WHERE 1=1';
+const dataCol = light
+? "CASE WHEN json_valid(data_json) THEN json_remove(data_json, '$.photos') ELSE data_json END AS data_json"
+: 'data_json';
+let query = 'SELECT id, magasin_code, magasin_libelle, ar, date, passage, humeur, ca_mensuel, ca_annuel, renta, ' + dataCol + ', created_at FROM bilans WHERE 1=1';
 const binds = [];
+const emptyResp = () => new Response(JSON.stringify({ ok: true, results: [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 if (magasinCode) {
 query += ' AND magasin_code = ?'; binds.push(magasinCode);
+} else if (codesParam.length) {
+const codes = allowedCodes ? codesParam.filter(c => allowedCodes.includes(c)) : codesParam;
+if (!codes.length) return emptyResp();
+query += ' AND magasin_code IN (' + codes.map(() => '?').join(',') + ')';
+binds.push(...codes);
 } else if (allowedCodes) {
-if (!allowedCodes.length) return new Response(JSON.stringify({ ok: true, results: [] }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+if (!allowedCodes.length) return emptyResp();
 query += ' AND magasin_code IN (' + allowedCodes.map(() => '?').join(',') + ')';
 binds.push(...allowedCodes);
 }
 if (from) { query += ' AND date >= ?'; binds.push(from); }
 if (to) { query += ' AND date <= ?'; binds.push(to); }
-query += ' ORDER BY date DESC LIMIT ?';
+query += ' ORDER BY date DESC, id DESC LIMIT ?';
 binds.push(limit);
 
 const { results } = await env.DB.prepare(query).bind(...binds).all();
@@ -5141,6 +5162,84 @@ status: 200,
 headers: { 'Content-Type': 'application/json', ...corsHeaders },
 });
 }
+
+if (url.pathname === '/bilan-get') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+const id = parseInt(url.searchParams.get('id') || '');
+if (!id) return jsonError('Paramètre id requis', 400, corsHeaders);
+const row = await env.DB.prepare('SELECT id, magasin_code, data_json FROM bilans WHERE id = ?').bind(id).first();
+if (!row) return jsonError('Bilan introuvable', 404, corsHeaders);
+if (sessionAr !== 'ALL') {
+const stores = await getMagasinsServerSide();
+const allowed = stores.filter(s => s.animateur === sessionAr).map(s => s.code);
+if (!allowed.includes(row.magasin_code)) return jsonError('Accès non autorisé à ce magasin', 403, corsHeaders);
+}
+let data; try { data = JSON.parse(row.data_json); } catch (e) { data = null; }
+return new Response(JSON.stringify({ ok: true, id: row.id, data }), {
+status: 200,
+headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+}
+
+if (url.pathname === '/import-bilans-local' && request.method === 'POST') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+let body; try { body = await request.json(); } catch (e) { return jsonError('JSON invalide', 400, corsHeaders); }
+const list = Array.isArray(body?.bilans) ? body.bilans.slice(0, 25) : [];
+if (!list.length) return jsonError('Aucun bilan à importer', 400, corsHeaders);
+let allowedCodes = null;
+if (sessionAr !== 'ALL') {
+const stores = await getMagasinsServerSide();
+allowedCodes = stores.filter(s => s.animateur === sessionAr).map(s => s.code);
+}
+let inserted = 0, skipped = 0, refused = 0;
+for (const data of list) {
+const code = data?.magasin?.code || null;
+const dateStr = typeof data?.date === 'string' ? data.date.slice(0, 10) : '';
+if (!code || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) { refused++; continue; }
+if (allowedCodes && !allowedCodes.includes(code)) { refused++; continue; }
+const passage = data.passage !== undefined && data.passage !== null && data.passage !== '' ? String(data.passage) : null;
+// Anti-doublon : même magasin, même date, même n° de passage = déjà en base.
+const exists = await env.DB.prepare(
+'SELECT id FROM bilans WHERE magasin_code = ? AND date = ? AND passage IS ? LIMIT 1'
+).bind(code, dateStr, passage).first();
+if (exists) { skipped++; continue; }
+const clean = { ...data, date: dateStr, passage, photos: null, _importeDepuisAppareil: true };
+delete clean.pdfB64;
+// created_at = date de la visite (et non la date d'import), pour que ces
+// anciens bilans n'apparaissent pas comme « saisis aujourd'hui » dans
+// l'onglet Aujourd'hui du dashboard.
+await env.DB.prepare(
+`INSERT INTO bilans (magasin_code, magasin_libelle, ar, date, passage, humeur, ca_mensuel, ca_annuel, renta, data_json, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+).bind(
+code,
+data?.magasin?.libelle || null,
+data.ar || null,
+dateStr,
+passage,
+data.humeur !== undefined && data.humeur !== '' && data.humeur !== null && !isNaN(parseInt(data.humeur)) ? parseInt(data.humeur) : null,
+data.ca_mensuel || null,
+data.ca_annuel || null,
+data.renta || null,
+JSON.stringify(clean),
+dateStr + ' 12:00:00'
+).run();
+inserted++;
+}
+return new Response(JSON.stringify({ ok: true, inserted, skipped, refused }), {
+status: 200,
+headers: { 'Content-Type': 'application/json', ...corsHeaders },
+});
+}
+// ---------- Fin historique des bilans ----------
 
 if (url.pathname === '/sante-mensuel') {
 // Score de santé mensuel « primes » (03/10) — voir handleSanteMensuel().
