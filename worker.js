@@ -1387,6 +1387,11 @@ const objPm = OBJECTIFS_RESEAU_PEDLV.pm, objTc = OBJECTIFS_RESEAU_PEDLV.tc;
 // Seuil de performance (consigne d'Olivier, 13/10) :
 // (Panier moyen × TC) / (objectif panier moyen × objectif TC), en %.
 const seuilPerf = (pm !== null && tc !== null && objPm && objTc) ? r1(pm * tc / (objPm * objTc) * 100) : null;
+// Seuil Pack Confort (consigne d'Olivier, 13/10) : PM pack confort × % PC
+// (fraction) × 100 — % PC est stocké en pourcentage (48 = 48 %), d'où PM × % PC.
+// Même échelle que l'objectif de kpis.csv (80 € × 50 % → 4000).
+const pcEurBrut = nb(stats.pm_pack_confort), pcPctBrut = nb(stats.taux_pack_confort);
+const seuilPc = (pcEurBrut !== null && pcPctBrut !== null) ? Math.round(pcEurBrut * pcPctBrut) : null;
 kpis = {
 sop: r1(nb(stats.taux_sop)),
 tc: r1(tc),
@@ -1401,6 +1406,7 @@ ndv: nb(stats.nb_vente_opt),
 pmPaire1: nb(stats.pm_paire1) !== null ? Math.round(nb(stats.pm_paire1)) : null,
 lukkas: r1(nb(stats.taux_lukkas)),
 seuilPerf,
+seuilPc,
 positionnement: r1(nb(stats.positionnement)),
 };
 }
