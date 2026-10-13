@@ -4511,7 +4511,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -5485,6 +5485,99 @@ networkTrend = Object.entries(parPeriode)
 return new Response(JSON.stringify({ ok: true, results, networkTrend }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur calcul fiche santé magasins : ' + String(e), 500, corsHeaders);
+}
+}
+
+if (url.pathname === '/score-magasin') {
+// Suivi Managers (13/10) : score de santé du magasin, consultable par son
+// manager — hebdo (même calcul que le dashboard AR) + mensuel (mois en cours
+// en aperçu, mois calculés tels qu'enregistrés). Décision d'Olivier : pas de
+// contrôle d'accès pour le moment (jeton magasin seul, pas de session AR).
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const code = url.searchParams.get('magasin_code');
+if (!code) return jsonError('Paramètre magasin_code requis', 400, corsHeaders);
+const stores = await getMagasinsServerSide();
+const store = stores.find(s => s.code === code);
+if (!store) return jsonError('Magasin inconnu', 404, corsHeaders);
+try {
+const poids = await getHealthWeights(env);
+
+// --- Hebdo : score courant + historique (26 semaines) ---
+let hebdo = null;
+try {
+const [base] = await buildStoreHealthResults(env, [store]);
+const sous = healthSubScoresServer(base);
+const score = computeHealthScoreServer(base, sous, poids);
+const pedlvIndic = (base.pedlv && base.pedlv.indicateurs) ? Object.entries(base.pedlv.indicateurs)
+.filter(([, v]) => v && v.statut).map(([cle, v]) => ({ cle, valeur: v.valeur, objectif: v.objectif, statut: v.statut })) : [];
+const { results: hist } = await env.DB.prepare(
+`SELECT period_key, score, score_actions, score_effectif, score_absenteisme, score_positionnement,
+score_pedlv, score_avis, score_equipe, score_kaizen, score_entretiens, score_lancements
+FROM store_health_score_history WHERE magasin_code = ? ORDER BY period_key DESC LIMIT 26`
+).bind(code).all();
+hebdo = {
+score, sous,
+details: {
+actions: base.actionsNonSoldees ? {
+reportees: base.actionsNonSoldees.items.filter(a => a.fromPrevious).length,
+aFaire: base.actionsNonSoldees.items.filter(a => a.fromPrevious && a.status === 'todo').length,
+items: base.actionsNonSoldees.items.filter(a => a.fromPrevious).slice(0, 10).map(a => ({ text: a.text, status: a.status, date: a.date, who: a.who })),
+} : null,
+dernierBilan: base.lastVisitDate || null,
+effectif: base.effectif || null, effectifRH: base.effectifRH || null,
+absenteisme: base.absenteisme || null,
+positionnementAnnuel: base.positionnementAnnuel ?? null,
+pedlv: base.pedlv ? { rouge: base.pedlv.rouge, total: base.pedlv.total, indicateurs: pedlvIndic } : null,
+avis: base.googleRating || null,
+equipe: { niveau: base.niveauEquipe ?? null, objectif: base.objectifNiveauEquipe || null },
+kaizen: { moisEnCours: base.kaizenScoreMois ?? null, dernierCloture: base.kaizenDernierMoisCloture || null,
+dernierScore: base.kaizenDernierScoreCloture ?? null, dernierMax: base.kaizenDernierScoreMax ?? null },
+entretiensLancements: base.entretiensLancements || null,
+},
+historique: (hist || []).reverse().map(r => ({
+periode: r.period_key, score: r.score,
+sous: { actions: r.score_actions, effectif: r.score_effectif, absenteisme: r.score_absenteisme, positionnement: r.score_positionnement,
+pedlv: r.score_pedlv, avis: r.score_avis, equipe: r.score_equipe, kaizen: r.score_kaizen, entretiens: r.score_entretiens, lancements: r.score_lancements },
+})),
+};
+} catch (e) { console.error('score-magasin (hebdo) :', e); }
+
+// --- Mensuel : mois en cours (aperçu, rien n'est enregistré) + 6 derniers mois calculés ---
+let mensuel = null;
+try {
+await ensureSanteMensuelTables(env);
+const moisCourant = parisTodayIso().slice(0, 7);
+let enCours = null;
+try {
+const neutra = await santeNeutralisationsAppliquees(env, moisCourant);
+const [l] = await collecterSanteMensuel(env, moisCourant, [store], null, { apercu: true });
+if (l) {
+const n = neutra[code] || {};
+enCours = { mois: moisCourant, poids, sous: l.sous, exclusions: l.exclusions, entrees: l.entrees, neutralisations: n,
+...santeScoreFinal(l.sous, l.exclusions, new Set(Object.keys(n)), poids) };
+}
+} catch (e) { console.error('score-magasin (mensuel en cours) :', e); }
+const { results: moisCalc } = await env.DB.prepare(`SELECT mois, statut, version, poids_json FROM sante_mensuel_mois WHERE mois < ? ORDER BY mois DESC LIMIT 6`).bind(moisCourant).all();
+const historique = [];
+for (const m of moisCalc || []) {
+const r = await env.DB.prepare(`SELECT score, couverture, sous_scores_json, exclusions_json, neutralisations_json, entrees_json FROM sante_mensuel WHERE mois = ? AND version = ? AND magasin_code = ?`).bind(m.mois, m.version, code).first();
+if (!r) continue;
+let entrees = {}; try { entrees = JSON.parse(r.entrees_json || '{}'); } catch (e) {}
+delete entrees._figes;
+let poidsMois = {}; try { poidsMois = JSON.parse(m.poids_json || '{}'); } catch (e) {}
+historique.push({ mois: m.mois, statut: m.statut, score: r.score, couverture: r.couverture, poids: poidsMois,
+sous: JSON.parse(r.sous_scores_json || '{}'), exclusions: JSON.parse(r.exclusions_json || '{}'),
+neutralisations: JSON.parse(r.neutralisations_json || '{}'), entrees });
+}
+mensuel = { enCours, historique };
+} catch (e) { console.error('score-magasin (mensuel) :', e); }
+
+return new Response(JSON.stringify({ ok: true, magasin: { code: store.code, libelle: store.libelle }, poids, hebdo, mensuel }),
+{ status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur score magasin : ' + String(e), 500, corsHeaders);
 }
 }
 
