@@ -1294,6 +1294,126 @@ const rawKey = normalizeName(row.magasin);
 return aliasResolution[rawKey] || rawKey;
 }
 
+// ---------- Pré-remplissage Bilan de Passage (13/10) ----------
+let _storeStatsColsBilanOk = false;
+async function ensureStoreStatsColonnesBilan(env) {
+if (_storeStatsColsBilanOk || !env.DB) return;
+for (const col of ['pm_paire1 REAL', 'taux_lukkas REAL']) {
+try { await env.DB.prepare(`ALTER TABLE store_stats ADD COLUMN ${col}`).run(); } catch (e) { /* colonne déjà présente */ }
+}
+_storeStatsColsBilanOk = true;
+}
+
+// Dernière ligne store_stats du magasin, quelle que soit la semaine (les stats
+// ne sont plus purgées chaque dimanche — rétention 24 mois). D'abord par code
+// magasin ; sinon par nom (anciens envois sans code), via la même résolution
+// d'alias que le reste du Worker, sur les 90 derniers jours.
+async function getDerniereStoreStats(env, store) {
+try {
+const parCode = await env.DB.prepare('SELECT * FROM store_stats WHERE code_magasin = ? ORDER BY id DESC LIMIT 1').bind(store.code).first();
+if (parCode) return parCode;
+} catch (e) {}
+try {
+const cle = normalizeName(store.libelle);
+const aliasResolution = await getStoreStatsAliasResolution(env);
+const stores = await getMagasinsServerSide();
+const storesByCode = new Map(stores.map(s => [s.code, s]));
+let rows;
+try {
+({ results: rows } = await env.DB.prepare("SELECT * FROM store_stats WHERE code_magasin IS NULL AND created_at >= datetime('now', '-90 days') ORDER BY id DESC LIMIT 2000").all());
+} catch (e) {
+({ results: rows } = await env.DB.prepare('SELECT * FROM store_stats WHERE code_magasin IS NULL ORDER BY id DESC LIMIT 2000').all());
+}
+for (const r of rows || []) {
+if (resolveStoreStatsKey(r, aliasResolution, storesByCode) === cle) return r;
+}
+} catch (e) { console.error('getDerniereStoreStats :', e); }
+return null;
+}
+
+// Première valeur non vide d'une requête tolérante (une table ou colonne
+// absente ne doit jamais faire échouer le récap).
+async function premiereLigne(env, sqls, binds) {
+const rows = await activiteQuery(env, sqls, binds);
+return (rows && rows[0]) || null;
+}
+
+async function buildBilanPrefill(env, store) {
+const code = store.code;
+const nb = v => (v === null || v === undefined || v === '' || !isFinite(Number(v))) ? null : Number(v);
+const r1 = v => v === null ? null : Math.round(v * 10) / 10;
+
+const [stats, bilan, kaizen, evalEq, entretien, lancement, accomp, obsMap] = await Promise.all([
+getDerniereStoreStats(env, store),
+premiereLigne(env, ['SELECT date, ar, passage FROM bilans WHERE magasin_code = ? ORDER BY date DESC, id DESC LIMIT 1'], [code]),
+premiereLigne(env, [
+'SELECT mois, closed, COALESCE(updated_at, closed_at) AS maj FROM kaizen_audits WHERE magasin_code = ? ORDER BY mois DESC, id DESC LIMIT 1',
+'SELECT mois, closed, closed_at AS maj FROM kaizen_audits WHERE magasin_code = ? ORDER BY mois DESC, id DESC LIMIT 1',
+], [code]),
+premiereLigne(env, ['SELECT date_controle AS date, ar_nom, tache FROM notes_equipe WHERE magasin_code = ? ORDER BY date_controle DESC, rowid DESC LIMIT 1'], [code]),
+premiereLigne(env, ['SELECT date, type, rempli_par FROM entretiens_manager WHERE magasin_code = ? ORDER BY date DESC, rowid DESC LIMIT 1'], [code]),
+premiereLigne(env, ['SELECT date, rempli_par FROM lancements_journee WHERE magasin_code = ? ORDER BY date DESC, rowid DESC LIMIT 1'], [code]),
+premiereLigne(env, ['SELECT date_visite AS date, statut, itinerant FROM accompagnements WHERE magasin_code = ? ORDER BY date_visite DESC, updated_at DESC LIMIT 1', 'SELECT date_visite AS date, statut, itinerant FROM accompagnements WHERE magasin_code = ? ORDER BY date_visite DESC LIMIT 1'], [code]),
+getLastObservationMap(env).catch(() => ({})),
+]);
+
+// Date ISO (AAAA-MM-JJ) à partir des formats rencontrés en base
+// (« 2026-10-3 » d'Observations Terrain, datetime SQLite, ISO complet).
+const isoJour = v => {
+if (!v) return null;
+const m = String(v).match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : null;
+};
+
+let kaizenDate = kaizen ? isoJour(kaizen.maj) : null;
+if (kaizen && !kaizenDate && /^\d{4}-\d{2}$/.test(kaizen.mois || '')) kaizenDate = kaizen.mois + '-01';
+
+const derniereActivite = {
+bilan: bilan ? { date: isoJour(bilan.date), detail: [bilan.passage ? 'passage n°' + bilan.passage : '', bilan.ar || ''].filter(Boolean).join(' — ') || null } : null,
+pedlv: stats ? { date: isoJour(stats.created_at), detail: stats.periode || null } : null,
+kaizen: kaizen ? { date: kaizenDate, detail: 'audit ' + (kaizen.mois || '') + (kaizen.closed ? ' (clôturé)' : ' (en cours)') } : null,
+evaluation: evalEq ? { date: isoJour(evalEq.date), detail: evalEq.tache || null } : null,
+observations: obsMap[normalizeName(store.libelle)] ? { date: isoJour(obsMap[normalizeName(store.libelle)]), detail: null } : null,
+suiviManagers: entretien ? { date: isoJour(entretien.date), detail: [entretien.type, entretien.rempli_par].filter(Boolean).join(' — ') || null } : null,
+lancement: lancement ? { date: isoJour(lancement.date), detail: lancement.rempli_par || null } : null,
+accompagnement: accomp ? { date: isoJour(accomp.date), detail: [accomp.statut, accomp.itinerant].filter(Boolean).join(' — ') || null } : null,
+};
+
+let kpis = null;
+if (stats) {
+await chargerObjectifsReseauPedlv();
+const pm = nb(stats.panier_moyen), tc = nb(stats.taux_tc);
+const objPm = OBJECTIFS_RESEAU_PEDLV.pm, objTc = OBJECTIFS_RESEAU_PEDLV.tc;
+// Seuil de performance (consigne d'Olivier, 13/10) :
+// (Panier moyen × TC) / (objectif panier moyen × objectif TC), en %.
+const seuilPerf = (pm !== null && tc !== null && objPm && objTc) ? r1(pm * tc / (objPm * objTc) * 100) : null;
+kpis = {
+sop: r1(nb(stats.taux_sop)),
+tc: r1(tc),
+pcPct: r1(nb(stats.taux_pack_confort)),
+pcEur: nb(stats.pm_pack_confort) !== null ? Math.round(nb(stats.pm_pack_confort)) : null,
+panierMoyen: pm !== null ? Math.round(pm) : null,
+mdc: r1(nb(stats.taux_mdc)),
+audioDepistage: r1(nb(stats.taux_test_auditif)),
+venteAdd: r1(nb(stats.taux_vente_add_audio)),
+nbProtheses: nb(stats.protheses_vendues),
+ndv: nb(stats.nb_vente_opt),
+pmPaire1: nb(stats.pm_paire1) !== null ? Math.round(nb(stats.pm_paire1)) : null,
+lukkas: r1(nb(stats.taux_lukkas)),
+seuilPerf,
+positionnement: r1(nb(stats.positionnement)),
+};
+}
+
+return {
+magasin: { code: store.code, libelle: store.libelle },
+stats: stats ? { date: isoJour(stats.created_at), periode: stats.periode || null, dateExtraction: stats.date_extraction || null } : null,
+kpis,
+derniereActivite,
+};
+}
+// ---------- Fin pré-remplissage Bilan de Passage ----------
+
 async function getStoreStatsMap(env) {
 if (!env.DB) return {};
 let results;
@@ -4382,7 +4502,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -5359,6 +5479,29 @@ return jsonError('Erreur calcul fiche santé magasins : ' + String(e), 500, cors
 }
 }
 
+if (url.pathname === '/bilan-prefill') {
+// Bilan de Passage (13/10) : écran de sélection magasin — dernière saisie dans
+// chaque appli + valeurs des indicateurs connues en base, pour pré-remplir le
+// bloc « Indicateurs clés ». Le récap détaillé reste servi par /store-health-detail.
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+const code = url.searchParams.get('magasin_code');
+if (!code) return jsonError('Paramètre magasin_code requis', 400, corsHeaders);
+const stores = await getMagasinsServerSide();
+const store = stores.find(s => s.code === code);
+if (!store) return jsonError('Magasin inconnu', 404, corsHeaders);
+if (sessionAr !== 'ALL' && store.animateur !== sessionAr) return jsonError('Magasin hors de votre périmètre', 403, corsHeaders);
+try {
+const data = await buildBilanPrefill(env, store);
+return new Response(JSON.stringify({ ok: true, ...data }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur pré-remplissage bilan : ' + String(e), 500, corsHeaders);
+}
+}
+
 if (url.pathname === '/store-health-detail') {
 // Écran détail magasin du dashboard réseau — assemble des données déjà
 // calculées ailleurs (score/sous-scores, PEDLV, Kaizen, équipe, RH) sans
@@ -6067,12 +6210,25 @@ s.tauxPackConfort ?? null, s.pmPackConfort ?? null,
 JSON.stringify(s.indicateurs || {}), s.nbVenteOpt ?? null, s.joursOuvresMois ?? null,
 (s.positionnement != null && isFinite(Number(s.positionnement))) ? Number(s.positionnement) : null
 ];
+let insStoreStats;
 try {
-await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}, created_at) VALUES (${valsStoreStats}, datetime('now'))`).bind(...bindsStoreStats).run();
+insStoreStats = await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}, created_at) VALUES (${valsStoreStats}, datetime('now'))`).bind(...bindsStoreStats).run();
 } catch (e) {
 // Repli : colonne created_at absente (ne devrait pas arriver après ensureRetentionColumns).
-await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}) VALUES (${valsStoreStats})`).bind(...bindsStoreStats).run();
+insStoreStats = await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}) VALUES (${valsStoreStats})`).bind(...bindsStoreStats).run();
 }
+// PM 1ère paire + % Lukkas (13/10, pré-remplissage Bilan de Passage) : écrits
+// à part, après l'insert principal — si les colonnes manquent ou si l'UPDATE
+// échoue, la ligne store_stats est déjà enregistrée, rien n'est perdu.
+try {
+const idStoreStats = insStoreStats && insStoreStats.meta && insStoreStats.meta.last_row_id;
+const numOuNull = v => (v != null && v !== '' && isFinite(Number(v)) && Number(v) > 0) ? Number(v) : null;
+const pmPaire1 = numOuNull(s.pmPaire1), tauxLukkas = (s.tauxLukkas != null && isFinite(Number(s.tauxLukkas))) ? Number(s.tauxLukkas) : null;
+if (idStoreStats && (pmPaire1 !== null || tauxLukkas !== null)) {
+await ensureStoreStatsColonnesBilan(env);
+await env.DB.prepare('UPDATE store_stats SET pm_paire1 = ?, taux_lukkas = ? WHERE id = ?').bind(pmPaire1, tauxLukkas, idStoreStats).run();
+}
+} catch (e) { console.error('store-stats : PM paire 1 / Lukkas non enregistrés :', e); }
 
 try {
 const periodKey = currentWeekMonday();
