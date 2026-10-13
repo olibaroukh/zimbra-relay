@@ -1298,7 +1298,7 @@ return aliasResolution[rawKey] || rawKey;
 let _storeStatsColsBilanOk = false;
 async function ensureStoreStatsColonnesBilan(env) {
 if (_storeStatsColsBilanOk || !env.DB) return;
-for (const col of ['pm_paire1 REAL', 'taux_lukkas REAL']) {
+for (const col of ['pm_paire1 REAL', 'taux_lukkas REAL', 'pm_prothese REAL', 'pm_vente_audio REAL', 'taux_assur_audio REAL']) {
 try { await env.DB.prepare(`ALTER TABLE store_stats ADD COLUMN ${col}`).run(); } catch (e) { /* colonne déjà présente */ }
 }
 _storeStatsColsBilanOk = true;
@@ -1387,6 +1387,11 @@ const objPm = OBJECTIFS_RESEAU_PEDLV.pm, objTc = OBJECTIFS_RESEAU_PEDLV.tc;
 // Seuil de performance (consigne d'Olivier, 13/10) :
 // (Panier moyen × TC) / (objectif panier moyen × objectif TC), en %.
 const seuilPerf = (pm !== null && tc !== null && objPm && objTc) ? r1(pm * tc / (objPm * objTc) * 100) : null;
+// Seuil Pack Confort (consigne d'Olivier, 13/10) : PM pack confort × % PC
+// (fraction) × 100 — % PC est stocké en pourcentage (48 = 48 %), d'où PM × % PC.
+// Même échelle que l'objectif de kpis.csv (80 € × 50 % → 4000).
+const pcEurBrut = nb(stats.pm_pack_confort), pcPctBrut = nb(stats.taux_pack_confort);
+const seuilPc = (pcEurBrut !== null && pcPctBrut !== null) ? Math.round(pcEurBrut * pcPctBrut) : null;
 kpis = {
 sop: r1(nb(stats.taux_sop)),
 tc: r1(tc),
@@ -1400,7 +1405,11 @@ nbProtheses: nb(stats.protheses_vendues),
 ndv: nb(stats.nb_vente_opt),
 pmPaire1: nb(stats.pm_paire1) !== null ? Math.round(nb(stats.pm_paire1)) : null,
 lukkas: r1(nb(stats.taux_lukkas)),
+pmProthese: nb(stats.pm_prothese) !== null ? Math.round(nb(stats.pm_prothese)) : null,
+pmVenteAudio: nb(stats.pm_vente_audio) !== null ? Math.round(nb(stats.pm_vente_audio)) : null,
+sap: r1(nb(stats.taux_assur_audio)),
 seuilPerf,
+seuilPc,
 positionnement: r1(nb(stats.positionnement)),
 };
 }
@@ -6217,18 +6226,23 @@ insStoreStats = await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}
 // Repli : colonne created_at absente (ne devrait pas arriver après ensureRetentionColumns).
 insStoreStats = await env.DB.prepare(`INSERT INTO store_stats (${colsStoreStats}) VALUES (${valsStoreStats})`).bind(...bindsStoreStats).run();
 }
-// PM 1ère paire + % Lukkas (13/10, pré-remplissage Bilan de Passage) : écrits
-// à part, après l'insert principal — si les colonnes manquent ou si l'UPDATE
-// échoue, la ligne store_stats est déjà enregistrée, rien n'est perdu.
+// Indicateurs complémentaires (13/10, pré-remplissage Bilan de Passage) :
+// PM 1ère paire, % Lukkas, PM prothèse, PM vente audio, % assurance audio (SAP).
+// Écrits à part, après l'insert principal — si les colonnes manquent ou si
+// l'UPDATE échoue, la ligne store_stats est déjà enregistrée, rien n'est perdu.
 try {
 const idStoreStats = insStoreStats && insStoreStats.meta && insStoreStats.meta.last_row_id;
-const numOuNull = v => (v != null && v !== '' && isFinite(Number(v)) && Number(v) > 0) ? Number(v) : null;
-const pmPaire1 = numOuNull(s.pmPaire1), tauxLukkas = (s.tauxLukkas != null && isFinite(Number(s.tauxLukkas))) ? Number(s.tauxLukkas) : null;
-if (idStoreStats && (pmPaire1 !== null || tauxLukkas !== null)) {
+const numOuNull = v => (v != null && v !== '' && isFinite(Number(v))) ? Number(v) : null;
+const extra = {
+pm_paire1: numOuNull(s.pmPaire1), taux_lukkas: numOuNull(s.tauxLukkas),
+pm_prothese: numOuNull(s.pmProthese), pm_vente_audio: numOuNull(s.pmVenteAudio), taux_assur_audio: numOuNull(s.tauxAssurAudio),
+};
+const cols = Object.keys(extra).filter(k => extra[k] !== null);
+if (idStoreStats && cols.length) {
 await ensureStoreStatsColonnesBilan(env);
-await env.DB.prepare('UPDATE store_stats SET pm_paire1 = ?, taux_lukkas = ? WHERE id = ?').bind(pmPaire1, tauxLukkas, idStoreStats).run();
+await env.DB.prepare(`UPDATE store_stats SET ${cols.map(k => k + ' = ?').join(', ')} WHERE id = ?`).bind(...cols.map(k => extra[k]), idStoreStats).run();
 }
-} catch (e) { console.error('store-stats : PM paire 1 / Lukkas non enregistrés :', e); }
+} catch (e) { console.error('store-stats : indicateurs complémentaires non enregistrés :', e); }
 
 try {
 const periodKey = currentWeekMonday();
