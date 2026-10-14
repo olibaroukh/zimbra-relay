@@ -158,7 +158,7 @@ async function getRhHealthSignalsMap(env) {
 
   let results;
   try {
-    ({ results } = await env.DB.prepare(`
+    results = await lectureRhEnCache(env, 'signaux', `
       SELECT
         es.mois as mois,
         es.code_site as code_site,
@@ -171,7 +171,7 @@ async function getRhHealthSignalsMap(env) {
       WHERE es.site_reconnu = 1
       GROUP BY es.mois, es.code_site
       ORDER BY es.mois ASC
-    `).all());
+    `);
   } catch(e) { console.error('Erreur lecture signaux RH (santé) :', e); return {}; }
 
   const parMagasin = {};
@@ -1221,10 +1221,26 @@ await env.DB.prepare('INSERT INTO cache_calculs (cle, json, maj) VALUES (?, ?, ?
 return val;
 });
 }
-async function invaliderCalculs(env) {
+// Lectures RH mises en cache 24 h (14/10, 13h50) : les jointures RH (effectif
+// × agenda × fiche collaborateur, tout le réseau sur plusieurs mois) coûtent
+// ~20-25 000 lignes chacune et représentaient la moitié des lectures restantes
+// alors que ces données ne changent qu'à l'import RH mensuel. Elles ne sont
+// vidées que par un import RH (inclureRh) — pas par un bilan ou un cron.
+const CACHE_RH_MS = 24 * 60 * 60 * 1000;
+function lectureRhEnCache(env, nom, sql, binds) {
+return calculMisEnCache(env, 'rh:' + nom + ':' + (binds || []).join('|'), CACHE_RH_MS, async () => {
+const st = env.DB.prepare(sql);
+const { results } = await (binds && binds.length ? st.bind(...binds) : st).all();
+return results || [];
+});
+}
+async function invaliderCalculs(env, inclureRh) {
 viderMemoD1();
 if (!env.DB) return;
-try { await ensureCacheCalculs(env); await env.DB.prepare('DELETE FROM cache_calculs').run(); } catch (e) { console.error('cache_calculs purge :', e); }
+try {
+await ensureCacheCalculs(env);
+await env.DB.prepare(inclureRh ? 'DELETE FROM cache_calculs' : "DELETE FROM cache_calculs WHERE cle NOT LIKE 'rh:%'").run();
+} catch (e) { console.error('cache_calculs purge :', e); }
 }
 // Aperçu du score mensuel (mois non encore calculé) : calculé pour tout le
 // réseau une fois, puis filtré sur les magasins demandés (le calcul est
@@ -2512,18 +2528,19 @@ const fin = santeFinMois(mois);
 const moisM1 = santeMoisDecale(mois, -1);
 const moisM2 = santeMoisDecale(mois, -2);
 const q = async (sql, ...b) => { const { results } = await env.DB.prepare(sql).bind(...b).all(); return results || []; };
+const qRh = (nom, sql, ...b) => lectureRhEnCache(env, nom, sql, b);
 
 const [bilans, notes, rhRows, rhElig, entretiens, lancements, kaizens, ratings, fermetures] = await Promise.all([
 q(`SELECT id, magasin_code, date, ca_annuel, data_json FROM (
 SELECT id, magasin_code, date, ca_annuel, data_json, ROW_NUMBER() OVER (PARTITION BY magasin_code ORDER BY date DESC, id DESC) AS rn
 FROM bilans WHERE date >= ? AND date <= ?) WHERE rn = 1`, debut, fin),
 q(`SELECT magasin_code, tache, note FROM notes_equipe WHERE annee = ? AND date_controle <= ?`, Number(mois.slice(0, 4)), fin),
-q(`SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids) AS eff_total,
+qRh('mensuel-absences', `SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids) AS eff_total,
 SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) AS eff_ld,
 SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
 FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
 WHERE es.site_reconnu = 1 AND es.mois >= ? AND es.mois <= ? GROUP BY es.mois, es.code_site`, santeMoisDecale(mois, -6), mois),
-q(`SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule, em.poste AS poste, em.prenom AS prenom, em.nom AS nom, a.longue_duree AS longue_duree
+qRh('mensuel-eligibles', `SELECT es.mois AS mois, es.code_site AS code_site, es.matricule AS matricule, em.poste AS poste, em.prenom AS prenom, em.nom AS nom, a.longue_duree AS longue_duree
 FROM rh_effectif_site_mensuel es JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
 LEFT JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
 WHERE es.site_reconnu = 1
@@ -3094,7 +3111,7 @@ const moisActuel = moisCible || parisTodayIso().slice(0, 7);
 
 let eligibleRows = [];
 try {
-({ results: eligibleRows } = await env.DB.prepare(
+eligibleRows = await lectureRhEnCache(env, 'eligibles-dernier-mois',
 `SELECT es.code_site, es.matricule, em.poste, em.prenom, em.nom, a.longue_duree
 FROM rh_effectif_site_mensuel es
 JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
@@ -3103,7 +3120,7 @@ INNER JOIN (
 SELECT code_site, MAX(mois) as maxmois FROM rh_effectif_site_mensuel WHERE site_reconnu = 1 GROUP BY code_site
 ) latest ON latest.code_site = es.code_site AND latest.maxmois = es.mois
 WHERE es.site_reconnu = 1`
-).all());
+);
 } catch (e) {}
 
 const storesRef = await getMagasinsServerSide();
@@ -4683,7 +4700,7 @@ async fetch(request, env) {
 chargerClesSession(env);
 if (request.method === 'POST') viderMemoD1();
 const _cheminRequete = new URL(request.url).pathname;
-if (request.method === 'POST' && ROUTES_INVALIDANT_CALCULS.has(_cheminRequete)) await invaliderCalculs(env);
+if (request.method === 'POST' && ROUTES_INVALIDANT_CALCULS.has(_cheminRequete)) await invaliderCalculs(env, _cheminRequete.startsWith('/rh-import'));
 await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
@@ -8754,7 +8771,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 
 async scheduled(event, env, ctx) {
 chargerClesSession(env);
-await invaliderCalculs(env);
+await invaliderCalculs(env, false);
 await chargerObjectifsReseauPedlv();
 const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
