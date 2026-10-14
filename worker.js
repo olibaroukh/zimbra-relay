@@ -1190,12 +1190,14 @@ const MEMO_ACTIVITE_MS = 60 * 1000;
 // (score santé hebdo, aperçu du score mensuel) sont désormais stockés en JSON
 // dans la table cache_calculs : une lecture = 1 ligne, recalcul au plus toutes
 // les CACHE_CALC_MS, pour tout le réseau d'un coup.
-// Invalidation : saisies qui changent fortement le score (bilan, PEDLV, imports
-// RH, Kaizen clôturé, évaluation équipe, fermetures, neutralisations) et début
-// de chaque cron. Les saisies fréquentes (lancements, entretiens, cases Kaizen,
-// observations) apparaissent au plus tard CACHE_CALC_MS après.
-const CACHE_CALC_MS = 5 * 60 * 1000;
-const ROUTES_INVALIDANT_CALCULS = new Set(['/store-bilan', '/store-stats', '/rh-import/effectif', '/rh-import/agenda', '/sante-mensuel', '/kaizen-lock', '/kaizen-import-historique', '/kaizen-import-historique-rollback', '/evaluation/controle', '/evaluation/correction', '/evaluation/supprimer-controle', '/fermetures-reseau']);
+// Invalidation (14/10, 13h) : uniquement les saisies peu fréquentes — bilan de
+// passage, imports RH, actions sur le score mensuel, imports Kaizen, fermetures
+// — et le début de chaque cron. Les saisies fréquentes (rapports PEDLV envoyés
+// à /store-stats à chaque génération, lancements, entretiens, Kaizen,
+// évaluation équipe, observations) apparaissent au plus tard CACHE_CALC_MS
+// après : les invalider relançait le calcul réseau des dizaines de fois par heure.
+const CACHE_CALC_MS = 15 * 60 * 1000;
+const ROUTES_INVALIDANT_CALCULS = new Set(['/store-bilan', '/rh-import/effectif', '/rh-import/agenda', '/sante-mensuel', '/kaizen-import-historique', '/kaizen-import-historique-rollback', '/fermetures-reseau']);
 let _cacheCalculsOk = false;
 async function ensureCacheCalculs(env) {
 if (_cacheCalculsOk || !env.DB) return;
