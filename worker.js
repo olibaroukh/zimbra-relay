@@ -1150,12 +1150,38 @@ async function ensureRetentionColumns(env) {
 if (_retentionColsOk || !env.DB) return;
 for (const t of ['store_stats', 'observations']) {
 try { await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN created_at TEXT`).run(); } catch (e) { /* colonne déjà présente */ }
-// Lignes antérieures au changement : toutes de la semaine en cours (purgées
-// le dimanche précédent), datées « maintenant » pour rester visibles.
-try { await env.DB.prepare(`UPDATE ${t} SET created_at = datetime('now') WHERE created_at IS NULL`).run(); } catch (e) {}
+// 13/10 : l'UPDATE ... WHERE created_at IS NULL (migration ponctuelle du 03/10)
+// est retiré — il relisait toute la table à chaque démarrage d'instance du
+// Worker. Tous les INSERT renseignent created_at depuis le 03/10.
 }
 _retentionColsOk = true;
 }
+
+// ---------- Cache mémoire des lectures D1 lourdes (13/10) ----------
+// Le 13/10 le quota gratuit D1 (5 M lignes lues / jour) a été dépassé : le
+// score santé relisait toutes les tables à chaque fiche ouverte, et l'onglet
+// « Aujourd'hui » du dashboard relance ~10 requêtes toutes les 2 min 30.
+// memoD1() garde le résultat en mémoire de l'instance pendant ttlMs et partage
+// une même lecture entre requêtes simultanées. Tout POST vide le cache (une
+// saisie est donc visible tout de suite sur l'instance qui l'a reçue, et au
+// pire après ttlMs ailleurs). Les crons partent aussi d'un cache vide.
+// Les résultats mis en cache sont partagés : ne jamais les modifier en place.
+const _memoD1 = new Map();
+function memoD1(cle, ttlMs, fn) {
+const now = Date.now();
+const hit = _memoD1.get(cle);
+if (hit && (now - hit.at) < ttlMs) return hit.promise;
+const promise = Promise.resolve().then(fn);
+promise.catch(() => { if (_memoD1.get(cle) && _memoD1.get(cle).promise === promise) _memoD1.delete(cle); });
+_memoD1.set(cle, { at: now, promise });
+if (_memoD1.size > 100) {
+for (const [k, v] of _memoD1) if ((now - v.at) > 15 * 60 * 1000) _memoD1.delete(k);
+}
+return promise;
+}
+function viderMemoD1() { _memoD1.clear(); }
+const MEMO_SANTE_MS = 5 * 60 * 1000;
+const MEMO_ACTIVITE_MS = 60 * 1000;
 // Dernier dimanche 20h00 UTC écoulé, au format datetime('now') de SQLite.
 function weeklyCutoffSql() {
 const now = new Date();
@@ -1425,6 +1451,9 @@ derniereActivite,
 
 async function getStoreStatsMap(env) {
 if (!env.DB) return {};
+return memoD1('storeStatsMap', MEMO_SANTE_MS, () => getStoreStatsMapD1(env));
+}
+async function getStoreStatsMapD1(env) {
 let results;
 try {
 results = await selectSemaineEnCours(env, 'SELECT * FROM store_stats WHERE created_at >= ? ORDER BY id DESC', 'SELECT * FROM store_stats ORDER BY id DESC');
@@ -2147,7 +2176,7 @@ const mois = jour.slice(0, 7);
 const byCode = new Map(scope.map(s => [s.code, s]));
 const byNom = new Map(scope.map(s => [normalizeName(s.libelle), s]));
 
-const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures, derniersBilans, dernieresEvals] = await Promise.all([
+const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures, derniersBilans, dernieresEvals] = await memoD1('activite:' + jour, MEMO_ACTIVITE_MS, () => Promise.all([
 activiteQuery(env, ['SELECT magasin_code, magasin_libelle, ar, date, created_at FROM bilans WHERE date = ? OR created_at >= ?'], [jour, veille]),
 activiteQuery(env, [
 'SELECT magasin_code, rempli_par, date, created_at FROM lancements_journee WHERE date = ?',
@@ -2172,7 +2201,7 @@ getFermeturesReseau(env),
 // (03/10) : affiché « il y a N j » quand rien n'a été fait ce jour-là.
 activiteQuery(env, ['SELECT magasin_code, MAX(date) AS d FROM bilans WHERE date <= ? GROUP BY magasin_code'], [jour]),
 activiteQuery(env, ['SELECT magasin_code, MAX(date_controle) AS d FROM notes_equipe WHERE date_controle <= ? GROUP BY magasin_code'], [jour]),
-]);
+]));
 
 const fermSet = fermeturesReseauSet(fermetures);
 const feries = feriesFermesSet(y, false);
@@ -3039,23 +3068,30 @@ return map;
 // Même logique que la route /store-health, factorisée pour être appelée aussi
 // bien par la route (scope filtré par session AR) que par le cron du digest
 // (scope = tous les magasins, sans notion de session).
-async function buildStoreHealthResults(env, scope) {
-const todayISO = new Date().toISOString().slice(0, 10);
+// Données du score santé, chargées une fois pour tout le réseau et gardées
+// MEMO_SANTE_MS (13/10) — une fiche magasin ne relit plus toutes les tables.
+function chargerDonneesSante(env) {
+return memoD1('donneesSante', MEMO_SANTE_MS, async () => {
 const healthWeights = await getHealthWeights(env);
 const snapshots = await getLastBilanSnapshots(env);
 const lastObservationMap = await getLastObservationMap(env);
-let ratingsMap = {};
+const ratingsMap = {};
 try {
 const { results: ratingRows } = await env.DB.prepare('SELECT magasin_code, rating, reviews_count FROM google_ratings').all();
 ratingRows.forEach(r => { ratingsMap[r.magasin_code] = { rating: r.rating, reviewsCount: r.reviews_count }; });
 } catch(e) {}
-
 const storeStatsMap = await getStoreStatsMap(env);
 const previousWeekPedlvMap = await getPreviousWeekPedlvMap(env);
 const niveauxEquipeMap = await getNiveauxEquipeMap(env);
 const kaizenHealthMap = await getKaizenHealthMap(env);
 const rhHealthMap = await getRhHealthSignalsMap(env);
 const entretiensLancementsMap = await getEntretiensLancementsMap(env);
+return { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap };
+});
+}
+async function buildStoreHealthResults(env, scope) {
+const todayISO = new Date().toISOString().slice(0, 10);
+const { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap } = await chargerDonneesSante(env);
 
 return scope.map(store => {
 const snap = snapshots[store.code] || null;
@@ -3140,6 +3176,9 @@ return Number.isFinite(n) ? n : null;
 
 async function getLastBilanSnapshots(env) {
 if (!env.DB) return {};
+return memoD1('lastBilanSnapshots', MEMO_SANTE_MS, () => getLastBilanSnapshotsD1(env));
+}
+async function getLastBilanSnapshotsD1(env) {
 const { results } = await env.DB.prepare(`
 SELECT magasin_code, date, ca_annuel, data_json FROM (
 SELECT magasin_code, date, ca_annuel, data_json,
@@ -4497,6 +4536,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 export default {
 async fetch(request, env) {
 chargerClesSession(env);
+if (request.method === 'POST') viderMemoD1();
 await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
@@ -5469,9 +5509,9 @@ if (!magasinCode && scope.length) {
 // dépasse la limite de variables SQL de D1 dès qu'on approche la centaine de
 // magasins). Filtrage et moyenne par période faits en mémoire côté JS.
 const codesScope = new Set(scope.map(s => s.code));
-const { results: allRows } = await env.DB.prepare(
+const { results: allRows } = await memoD1('histoScores', MEMO_SANTE_MS, () => env.DB.prepare(
 `SELECT magasin_code, period_key, score FROM store_health_score_history WHERE score IS NOT NULL ORDER BY period_key ASC`
-).all();
+).all());
 const parPeriode = {};
 for (const r of allRows) {
 if (!codesScope.has(r.magasin_code)) continue;
@@ -5903,11 +5943,11 @@ const scopeByCode = new Map(scope.map(s => [s.code, s]));
 
 // --- Historique moyen (mêmes colonnes que /store-health-detail, moyennées sur le périmètre) ---
 const codesScope = new Set(scope.map(s => s.code));
-const { results: allRows } = await env.DB.prepare(
+const { results: allRows } = await memoD1('histoScoresDetail', MEMO_SANTE_MS, () => env.DB.prepare(
 `SELECT magasin_code, period_key, score, score_actions, score_effectif, score_absenteisme, score_positionnement,
 score_pedlv, score_avis, score_equipe, score_kaizen, score_entretiens, score_lancements
 FROM store_health_score_history WHERE score IS NOT NULL ORDER BY period_key ASC`
-).all();
+).all());
 const parPeriode = {};
 for (const r of allRows) {
 if (!codesScope.has(r.magasin_code)) continue;
@@ -8283,6 +8323,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 
 async scheduled(event, env, ctx) {
 chargerClesSession(env);
+viderMemoD1();
 await chargerObjectifsReseauPedlv();
 const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
