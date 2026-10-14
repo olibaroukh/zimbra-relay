@@ -1239,6 +1239,73 @@ if (stores.every(st => parCode.has(st.code))) return stores.map(st => parCode.ge
 }
 return collecterSanteMensuel(env, mois, stores, null, { apercu: true });
 }
+// ---------- Réunion mensuelle + brouillons serveur — Suivi Managers (14/10) ----------
+// Réunion mensuelle : présents (import RH + ajouts), points structurés (sujet,
+// détail, mise en place, objectif + échéance), sujets imposés par Olivier
+// (réseau) ou par l'AR (ses magasins) pour un mois donné, signature de chaque
+// présent, PDF envoyé au magasin et à l'AR. Une réunion validée compte comme un
+// lancement de journée (ligne lancements_journee liée par reunion_id, jamais
+// « en retard » : la réunion peut se tenir le soir). Les objectifs datés
+// entrent dans suivis_entretien (bandeau « À suivre », actions qui traînent).
+// Signatures réduites (JPEG ~3-5 Ko) et stockées dans la base ARCHIVES quand
+// elle est liée, pour ne pas faire grossir bilan-passage-db ; jamais lues par
+// la liste de l'historique (seulement à l'ouverture d'une réunion précise).
+// Brouillons serveur : toutes les tuiles de Suivi Managers, plusieurs par
+// magasin, sans signatures, purgés après 30 jours sans modification.
+const BROUILLON_PURGE_JOURS = 30;
+const TYPES_REUNION = { bilan_mois: 'Bilan du mois précédent', debrief: 'Débrief réunion groupe' };
+const SOUS_TYPES_DEBRIEF = { managers: 'Réunion managers', produit: 'Réunion produit', annuelle: 'Réunion annuelle', autre: 'Autre' };
+let _reunionTablesOk = false;
+async function ensureReunionTables(env) {
+if (_reunionTablesOk || !env.DB) return;
+await env.DB.batch([
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS reunions_magasin (id INTEGER PRIMARY KEY AUTOINCREMENT, magasin_code TEXT NOT NULL, magasin_libelle TEXT, animateur TEXT, type_reunion TEXT NOT NULL, sous_type TEXT, intitule TEXT, rempli_par TEXT, poste_rempli_par TEXT, date TEXT NOT NULL, presents_json TEXT, absents_json TEXT, points_json TEXT, signatures_json TEXT, lancement_id INTEGER, created_at TEXT DEFAULT (datetime('now')))`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_reunions_code_date ON reunions_magasin(magasin_code, date)`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_reunions_date ON reunions_magasin(date)`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS reunion_sujets (id INTEGER PRIMARY KEY AUTOINCREMENT, portee TEXT NOT NULL, ar TEXT, mois TEXT NOT NULL, titre TEXT NOT NULL, detail TEXT, cree_par TEXT, created_at TEXT DEFAULT (datetime('now')))`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_reunion_sujets_mois ON reunion_sujets(mois)`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS reunion_sujets_traites (sujet_id INTEGER NOT NULL, magasin_code TEXT NOT NULL, reunion_id INTEGER NOT NULL, PRIMARY KEY (sujet_id, magasin_code))`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sujets_traites_reunion ON reunion_sujets_traites(reunion_id)`),
+env.DB.prepare(`CREATE TABLE IF NOT EXISTS brouillons_suivi (id INTEGER PRIMARY KEY AUTOINCREMENT, magasin_code TEXT NOT NULL, ecran TEXT NOT NULL, libelle TEXT, cree_par TEXT, json TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')))`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_brouillons_code ON brouillons_suivi(magasin_code, updated_at)`),
+env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_brouillons_updated ON brouillons_suivi(updated_at)`),
+]);
+for (const sql of [`ALTER TABLE lancements_journee ADD COLUMN reunion_id INTEGER`, `ALTER TABLE suivis_entretien ADD COLUMN reunion_id INTEGER`]) {
+try { await env.DB.prepare(sql).run(); } catch (e) { /* colonne déjà présente */ }
+}
+if (env.ARCHIVES) {
+try { await env.ARCHIVES.prepare(`CREATE TABLE IF NOT EXISTS reunion_signatures (reunion_id INTEGER PRIMARY KEY, json TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))`).run(); } catch (e) { console.error('Table reunion_signatures (ARCHIVES) :', e); }
+}
+_reunionTablesOk = true;
+}
+function txt(v, max) { return String(v == null ? '' : v).trim().slice(0, max); }
+function isoDateOk(d) { return /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')); }
+// Sujets imposés à un magasin pour un mois : réseau + ceux de son AR, moins ceux
+// déjà traités dans une réunion validée du magasin.
+async function sujetsImposesMagasin(env, magasin, mois) {
+const { results } = await env.DB.prepare(
+`SELECT s.id, s.portee, s.ar, s.titre, s.detail FROM reunion_sujets s
+WHERE s.mois = ? AND (s.portee = 'reseau' OR (s.portee = 'ar' AND s.ar = ?))
+AND NOT EXISTS (SELECT 1 FROM reunion_sujets_traites t WHERE t.sujet_id = s.id AND t.magasin_code = ?)
+ORDER BY CASE s.portee WHEN 'reseau' THEN 0 ELSE 1 END, s.id`
+).bind(mois, magasin.animateur || '', String(magasin.code)).all();
+return results || [];
+}
+function libelleReunion(r) {
+const base = TYPES_REUNION[r.type_reunion] || 'Réunion mensuelle';
+if (r.type_reunion !== 'debrief') return base;
+const st = r.sous_type === 'autre' ? (r.intitule || 'Autre') : (SOUS_TYPES_DEBRIEF[r.sous_type] || '');
+return st ? `${base} — ${st}` : base;
+}
+async function lireSignaturesReunion(env, reunion) {
+if (env.ARCHIVES) {
+try {
+const row = await env.ARCHIVES.prepare(`SELECT json FROM reunion_signatures WHERE reunion_id = ?`).bind(reunion.id).first();
+if (row) return JSON.parse(row.json || '{}');
+} catch (e) { console.error('Lecture signatures réunion :', e); }
+}
+try { return JSON.parse(reunion.signatures_json || '{}'); } catch (e) { return {}; }
+}
 // Dernier dimanche 20h00 UTC écoulé, au format datetime('now') de SQLite.
 function weeklyCutoffSql() {
 const now = new Date();
@@ -1306,7 +1373,7 @@ try { await env.DB.prepare(`DELETE FROM observations WHERE created_at < datetime
 try { await env.DB.prepare(`DELETE FROM store_stats WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge store_stats (> 24 mois) échouée:', e); }
 if (env.ARCHIVES) {
 try { await ensureArchivesTable(env); await env.ARCHIVES.prepare(`DELETE FROM pedlv_rapports WHERE created_at < datetime('now', ?)`).bind(limite).run(); } catch(e) { console.error('Purge archives PEDLV (> 24 mois) échouée:', e); }
-}
+}try { await ensureReunionTables(env); await env.DB.prepare(`DELETE FROM brouillons_suivi WHERE updated_at < datetime('now', ?)`).bind(`-${BROUILLON_PURGE_JOURS} days`).run(); } catch(e) { console.error('Purge brouillons Suivi Managers (> 30 j) échouée:', e); }
 }
 
 // 29/09 : semaine du lundi au SAMEDI (avant : lundi-vendredi, les bilans du
@@ -2236,6 +2303,7 @@ const byNom = new Map(scope.map(s => [normalizeName(s.libelle), s]));
 const [bilans, lancements, entretiens, notes, observations, kaizens, pedlvs, fermetures, derniersBilans, dernieresEvals] = await memoD1('activite:' + jour, MEMO_ACTIVITE_MS, () => Promise.all([
 activiteQuery(env, ['SELECT magasin_code, magasin_libelle, ar, date, created_at FROM bilans WHERE date = ? OR created_at >= ?'], [jour, veille]),
 activiteQuery(env, [
+'SELECT magasin_code, rempli_par, date, created_at, reunion_id FROM lancements_journee WHERE date = ?',
 'SELECT magasin_code, rempli_par, date, created_at FROM lancements_journee WHERE date = ?',
 'SELECT magasin_code, rempli_par, date FROM lancements_journee WHERE date = ?',
 ], [jour]),
@@ -2287,7 +2355,14 @@ for (const r of lancements) {
 const s = byCode.get(r.magasin_code); if (!s) continue;
 const L = res[s.code].lancement;
 const heure = activiteParisHeure(r.created_at);
-if (L.statut !== 'fait' || (heure && L.heure && heure < L.heure)) { L.statut = 'fait'; L.heure = heure; L.par = r.rempli_par || null; }
+// 14/10 : réunion mensuelle = lancement du jour, jamais « en retard » (elle
+// peut se tenir le soir) — heure retenue nulle pour le butoir.
+if (r.reunion_id) {
+L.statut = 'fait'; L.heure = null; L.par = L.par || r.rempli_par || null; L.reunion = true;
+pushEvent(s, 'lancement', 'Réunion mensuelle (vaut lancement de journée)', r.rempli_par, r.created_at, heure);
+continue;
+}
+if (L.statut !== 'fait' || (heure && L.heure && heure < L.heure)) { if (!L.reunion) { L.statut = 'fait'; L.heure = heure; L.par = r.rempli_par || null; } }
 pushEvent(s, 'lancement', 'Lancement de journée' + (heure && heure > LANCEMENT_HEURE_BUTOIR ? ' (en retard)' : ''), r.rempli_par, r.created_at, heure);
 }
 // Lancement saisi après l'heure butoir (03/10, cas Franconville 12h19) : compté
@@ -3485,7 +3560,7 @@ return {
 libelleMagasin: store ? store.libelle : (r.magasin_libelle || r.magasin_code),
 animateur: store ? store.animateur : null,
 collaborateur: r.collaborateur_nom || '—',
-type: LIBELLES_ENTRETIEN[r.type_entretien] || r.type_entretien,
+type: r.type_entretien === 'reunion_mensuelle' ? 'Réunion mensuelle' : (LIBELLES_ENTRETIEN[r.type_entretien] || r.type_entretien),
 libelle: r.libelle, echeance: r.echeance, retard: jours(r.echeance),
 };
 });
@@ -4623,7 +4698,7 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau' || url.pathname === '/brouillons' || url.pathname === '/brouillon-get' || url.pathname === '/reunion-sujets' || url.pathname === '/reunion-sujets-admin' || url.pathname === '/reunion-get'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -6973,9 +7048,18 @@ const magasin = stores.find(s => String(s.code) === String(magasinCode)) || null
 const animateur = magasin ? magasin.animateur : null;
 
 // 09/10 (anti-doublons) : un seul lancement par magasin et par jour.
-const existantL = await env.DB.prepare(
+// 14/10 : un lancement créé par une réunion mensuelle ne bloque pas un vrai
+// lancement le même jour (le score compte les jours, pas les saisies).
+let existantL;
+try {
+existantL = await env.DB.prepare(
+`SELECT id FROM lancements_journee WHERE CAST(COALESCE(magasin_code, '') AS TEXT) = ? AND date = ? AND reunion_id IS NULL LIMIT 1`
+).bind(String(magasinCode || ''), date).first();
+} catch (e) {
+existantL = await env.DB.prepare(
 `SELECT id FROM lancements_journee WHERE CAST(COALESCE(magasin_code, '') AS TEXT) = ? AND date = ? LIMIT 1`
 ).bind(String(magasinCode || ''), date).first();
+}
 if (existantL) return new Response(JSON.stringify({ ok: true, id: existantL.id, deja: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 await env.DB.prepare(
@@ -7009,6 +7093,258 @@ return jsonError('Erreur enregistrement lancement : ' + String(e), 500, corsHead
 }
 }
 
+// ---------- Brouillons serveur Suivi Managers (14/10) ----------
+// Liste (en-têtes seulement, jamais le contenu), lecture, enregistrement
+// (création ou mise à jour), suppression. Toujours bornés au magasin.
+if (url.pathname === '/brouillons' || url.pathname === '/brouillon-get' || url.pathname === '/brouillon-save' || url.pathname === '/brouillon-supprimer') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const jsonOk = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+try {
+await ensureReunionTables(env);
+if (url.pathname === '/brouillons') {
+const code = url.searchParams.get('magasin_code');
+if (!code) return jsonError('magasin_code manquant', 400, corsHeaders);
+const { results } = await env.DB.prepare(
+`SELECT id, ecran, libelle, cree_par, updated_at FROM brouillons_suivi WHERE magasin_code = ? AND updated_at >= datetime('now', ?) ORDER BY updated_at DESC LIMIT 50`
+).bind(String(code), `-${BROUILLON_PURGE_JOURS} days`).all();
+return jsonOk({ ok: true, brouillons: results || [] });
+}
+if (url.pathname === '/brouillon-get') {
+const id = Number(url.searchParams.get('id'));
+const code = url.searchParams.get('magasin_code');
+if (!Number.isInteger(id) || !code) return jsonError('Paramètres manquants', 400, corsHeaders);
+const row = await env.DB.prepare(`SELECT id, ecran, libelle, cree_par, json, updated_at FROM brouillons_suivi WHERE id = ? AND magasin_code = ?`).bind(id, String(code)).first();
+if (!row) return jsonError('Brouillon introuvable (déjà envoyé ou supprimé)', 404, corsHeaders);
+return jsonOk({ ok: true, brouillon: { id: row.id, ecran: row.ecran, libelle: row.libelle, creePar: row.cree_par, updatedAt: row.updated_at, data: JSON.parse(row.json || '{}') } });
+}
+const body = await request.json().catch(() => null);
+if (!body || !body.magasinCode) return jsonError('magasinCode manquant', 400, corsHeaders);
+const code = String(body.magasinCode);
+if (url.pathname === '/brouillon-supprimer') {
+const id = Number(body.id);
+if (!Number.isInteger(id)) return jsonError('id manquant', 400, corsHeaders);
+await env.DB.prepare(`DELETE FROM brouillons_suivi WHERE id = ? AND magasin_code = ?`).bind(id, code).run();
+return jsonOk({ ok: true });
+}
+// /brouillon-save
+const ecran = txt(body.ecran, 40);
+if (!/^screen-[a-z-]+$/.test(ecran)) return jsonError('Écran invalide', 400, corsHeaders);
+const json = JSON.stringify(body.data || {});
+if (json.length > 300000) return jsonError('Brouillon trop volumineux', 413, corsHeaders);
+const libelle = txt(body.libelle, 200), creePar = txt(body.creePar, 80);
+const id = Number(body.id);
+if (Number.isInteger(id) && id > 0) {
+const r = await env.DB.prepare(`UPDATE brouillons_suivi SET ecran = ?, libelle = ?, cree_par = COALESCE(NULLIF(?, ''), cree_par), json = ?, updated_at = datetime('now') WHERE id = ? AND magasin_code = ?`)
+.bind(ecran, libelle, creePar, json, id, code).run();
+if (r && r.meta && r.meta.changes) return jsonOk({ ok: true, id });
+}
+const ins = await env.DB.prepare(`INSERT INTO brouillons_suivi (magasin_code, ecran, libelle, cree_par, json) VALUES (?, ?, ?, ?, ?)`).bind(code, ecran, libelle, creePar, json).run();
+return jsonOk({ ok: true, id: ins && ins.meta ? ins.meta.last_row_id : null });
+} catch (e) {
+return jsonError('Erreur brouillon : ' + String(e), 500, corsHeaders);
+}
+}
+
+// ---------- Sujets imposés pour la réunion mensuelle (14/10) ----------
+// Côté magasin (jeton magasin) : sujets du mois à traiter. Côté AR / Olivier
+// (session AR) : liste, création, suppression. Olivier crée des sujets réseau,
+// un AR des sujets pour ses magasins.
+if (url.pathname === '/reunion-sujets') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+await ensureReunionTables(env);
+const code = url.searchParams.get('magasin_code');
+const mois = url.searchParams.get('mois') || parisTodayIso().slice(0, 7);
+if (!code || !/^\d{4}-\d{2}$/.test(mois)) return jsonError('Paramètres invalides', 400, corsHeaders);
+const stores = await getMagasinsServerSide();
+const magasin = stores.find(s => String(s.code) === String(code));
+if (!magasin) return jsonError('Magasin inconnu', 404, corsHeaders);
+const sujets = await sujetsImposesMagasin(env, magasin, mois);
+return new Response(JSON.stringify({ ok: true, mois, sujets }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur sujets imposés : ' + String(e), 500, corsHeaders);
+}
+}
+if (url.pathname === '/reunion-sujets-admin' || url.pathname === '/reunion-sujet-save' || url.pathname === '/reunion-sujet-supprimer') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+const jsonOk = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+try {
+await ensureReunionTables(env);
+if (url.pathname === '/reunion-sujets-admin') {
+const depuis = parisTodayIso().slice(0, 7);
+const sql = sessionAr === 'ALL'
+? `SELECT s.*, (SELECT COUNT(*) FROM reunion_sujets_traites t WHERE t.sujet_id = s.id) AS nb_traites FROM reunion_sujets s WHERE s.mois >= ? ORDER BY s.mois, s.portee DESC, s.id`
+: `SELECT s.*, (SELECT COUNT(*) FROM reunion_sujets_traites t WHERE t.sujet_id = s.id) AS nb_traites FROM reunion_sujets s WHERE s.mois >= ? AND (s.portee = 'reseau' OR s.ar = ?) ORDER BY s.mois, s.portee DESC, s.id`;
+const stmt = env.DB.prepare(sql);
+const { results } = await (sessionAr === 'ALL' ? stmt.bind(depuis) : stmt.bind(depuis, sessionAr)).all();
+const stores = await getMagasinsServerSide();
+const nbMagasinsAr = {};
+stores.forEach(s => { nbMagasinsAr[s.animateur] = (nbMagasinsAr[s.animateur] || 0) + 1; });
+const sujets = (results || []).map(s => ({ ...s, nb_magasins: s.portee === 'reseau' ? stores.length : (nbMagasinsAr[s.ar] || 0), modifiable: sessionAr === 'ALL' || (s.portee === 'ar' && s.ar === sessionAr) }));
+return jsonOk({ ok: true, ar: sessionAr, estOlivier: sessionAr === 'ALL', sujets });
+}
+const body = await request.json().catch(() => null);
+if (!body) return jsonError('Corps invalide', 400, corsHeaders);
+if (url.pathname === '/reunion-sujet-supprimer') {
+const id = Number(body.id);
+if (!Number.isInteger(id)) return jsonError('id manquant', 400, corsHeaders);
+const s = await env.DB.prepare(`SELECT * FROM reunion_sujets WHERE id = ?`).bind(id).first();
+if (!s) return jsonError('Sujet introuvable', 404, corsHeaders);
+if (!(sessionAr === 'ALL' || (s.portee === 'ar' && s.ar === sessionAr))) return jsonError('Ce sujet ne t\'appartient pas', 403, corsHeaders);
+await env.DB.prepare(`DELETE FROM reunion_sujets WHERE id = ?`).bind(id).run();
+return jsonOk({ ok: true });
+}
+// /reunion-sujet-save
+const mois = txt(body.mois, 7), titre = txt(body.titre, 200), detail = txt(body.detail, 3000);
+if (!/^\d{4}-\d{2}$/.test(mois) || !titre) return jsonError('Mois et titre obligatoires', 400, corsHeaders);
+const portee = sessionAr === 'ALL' ? 'reseau' : 'ar';
+const id = Number(body.id);
+if (Number.isInteger(id) && id > 0) {
+const s = await env.DB.prepare(`SELECT * FROM reunion_sujets WHERE id = ?`).bind(id).first();
+if (!s) return jsonError('Sujet introuvable', 404, corsHeaders);
+if (!(sessionAr === 'ALL' || (s.portee === 'ar' && s.ar === sessionAr))) return jsonError('Ce sujet ne t\'appartient pas', 403, corsHeaders);
+await env.DB.prepare(`UPDATE reunion_sujets SET mois = ?, titre = ?, detail = ? WHERE id = ?`).bind(mois, titre, detail, id).run();
+return jsonOk({ ok: true, id });
+}
+const ins = await env.DB.prepare(`INSERT INTO reunion_sujets (portee, ar, mois, titre, detail, cree_par) VALUES (?, ?, ?, ?, ?, ?)`)
+.bind(portee, portee === 'ar' ? sessionAr : null, mois, titre, detail, sessionAr).run();
+return jsonOk({ ok: true, id: ins && ins.meta ? ins.meta.last_row_id : null });
+} catch (e) {
+return jsonError('Erreur sujets imposés : ' + String(e), 500, corsHeaders);
+}
+}
+
+// ---------- Validation d'une réunion mensuelle (14/10) ----------
+if (url.pathname === '/reunion-mensuelle') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+try {
+await ensureReunionTables(env);
+const b = await request.json();
+const stores = await getMagasinsServerSide();
+const magasin = stores.find(s => String(s.code) === String(b.magasinCode)) || null;
+if (!magasin) return jsonError('Magasin inconnu', 400, corsHeaders);
+const typeReunion = TYPES_REUNION[b.typeReunion] ? b.typeReunion : null;
+const remplipar = txt(b.remplipar, 80), poste = txt(b.poste, 80), date = txt(b.date, 10);
+if (!typeReunion || !remplipar || !isoDateOk(date)) return jsonError('Type, prénom et date obligatoires', 400, corsHeaders);
+const sousType = typeReunion === 'debrief' && SOUS_TYPES_DEBRIEF[b.sousType] ? b.sousType : null;
+const intitule = txt(b.intitule, 150);
+const presents = (Array.isArray(b.presents) ? b.presents : []).slice(0, 60).map(p => ({ nom: txt(p && p.nom, 100), fonction: txt(p && p.fonction, 80), signature: typeof (p && p.signature) === 'string' && p.signature.startsWith('data:image/') && p.signature.length < 60000 ? p.signature : null })).filter(p => p.nom);
+const absents = (Array.isArray(b.absents) ? b.absents : []).slice(0, 60).map(n => txt(n, 100)).filter(Boolean);
+if (!presents.length) return jsonError('Aucun présent', 400, corsHeaders);
+if (presents.some(p => !p.signature)) return jsonError('Chaque présent doit signer (ou être décoché)', 400, corsHeaders);
+const points = (Array.isArray(b.points) ? b.points : []).slice(0, 40).map(p => ({
+sujetId: Number.isInteger(Number(p && p.sujetId)) && Number(p.sujetId) > 0 ? Number(p.sujetId) : null,
+portee: ['reseau', 'ar'].includes(p && p.portee) ? p.portee : null,
+titre: txt(p && p.titre, 200), detail: txt(p && p.detail, 3000), miseEnPlace: txt(p && p.miseEnPlace, 3000),
+objectif: txt(p && p.objectif, 500), echeance: isoDateOk(p && p.echeance) ? p.echeance : '',
+})).filter(p => p.titre);
+// Sujets imposés du mois : tous présents et tous renseignés (mise en place).
+const imposes = await sujetsImposesMagasin(env, magasin, date.slice(0, 7));
+for (const s of imposes) {
+const p = points.find(x => x.sujetId === s.id);
+if (!p) return jsonError(`Sujet imposé manquant : « ${s.titre} »`, 400, corsHeaders);
+if (!p.miseEnPlace) return jsonError(`Mise en place à renseigner pour le sujet imposé « ${s.titre} »`, 400, corsHeaders);
+p.titre = s.titre; p.detail = s.detail || ''; p.portee = s.portee;
+}
+// Anti-doublon : même magasin, même date, même type de réunion (et même sous-type).
+const existant = await env.DB.prepare(`SELECT id FROM reunions_magasin WHERE magasin_code = ? AND date = ? AND type_reunion = ? AND COALESCE(sous_type, '') = ? LIMIT 1`)
+.bind(String(magasin.code), date, typeReunion, sousType || '').first();
+if (existant) return new Response(JSON.stringify({ ok: true, id: existant.id, deja: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+
+const signatures = {};
+presents.forEach((p, i) => { signatures[i] = p.signature; });
+const presentsSansSig = presents.map(p => ({ nom: p.nom, fonction: p.fonction }));
+const ins = await env.DB.prepare(
+`INSERT INTO reunions_magasin (magasin_code, magasin_libelle, animateur, type_reunion, sous_type, intitule, rempli_par, poste_rempli_par, date, presents_json, absents_json, points_json, signatures_json)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+).bind(String(magasin.code), magasin.libelle, magasin.animateur || null, typeReunion, sousType, intitule, remplipar, poste, date,
+JSON.stringify(presentsSansSig), JSON.stringify(absents), JSON.stringify(points), env.ARCHIVES ? null : JSON.stringify(signatures)).run();
+const reunionId = ins && ins.meta ? ins.meta.last_row_id : null;
+if (env.ARCHIVES && reunionId) {
+try { await env.ARCHIVES.prepare(`INSERT OR REPLACE INTO reunion_signatures (reunion_id, json) VALUES (?, ?)`).bind(reunionId, JSON.stringify(signatures)).run(); }
+catch (e) {
+console.error('Signatures réunion non archivées, repli base principale :', e);
+await env.DB.prepare(`UPDATE reunions_magasin SET signatures_json = ? WHERE id = ?`).bind(JSON.stringify(signatures), reunionId).run();
+}
+}
+const libelle = libelleReunion({ type_reunion: typeReunion, sous_type: sousType, intitule });
+// Compte comme lancement de journée (sauf si un lancement existe déjà ce jour-là).
+let lancementId = null;
+try {
+const dejaL = await env.DB.prepare(`SELECT id FROM lancements_journee WHERE CAST(COALESCE(magasin_code, '') AS TEXT) = ? AND date = ? LIMIT 1`).bind(String(magasin.code), date).first();
+if (!dejaL) {
+const insL = await env.DB.prepare(
+`INSERT INTO lancements_journee (magasin_code, magasin_libelle, animateur, rempli_par, poste_rempli_par, date, presents_json, objectifs, note_libre, mensuel_json, reunion_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+).bind(String(magasin.code), magasin.libelle, magasin.animateur || null, remplipar, poste || 'Réunion mensuelle', date,
+JSON.stringify(presents.map(p => p.nom)), 'Réunion mensuelle — ' + libelle, '', '{}', reunionId).run();
+lancementId = insL && insL.meta ? insL.meta.last_row_id : null;
+await env.DB.prepare(`UPDATE reunions_magasin SET lancement_id = ? WHERE id = ?`).bind(lancementId, reunionId).run();
+}
+} catch (e) { console.error('Lancement lié à la réunion non créé :', e); }
+// Sujets imposés traités + objectifs datés → suivis (bandeau « À suivre »).
+try {
+const stmts = [];
+for (const p of points) {
+if (p.sujetId && imposes.some(s => s.id === p.sujetId)) stmts.push(env.DB.prepare(`INSERT OR IGNORE INTO reunion_sujets_traites (sujet_id, magasin_code, reunion_id) VALUES (?, ?, ?)`).bind(p.sujetId, String(magasin.code), reunionId));
+if (p.objectif && p.echeance) stmts.push(env.DB.prepare(
+`INSERT INTO suivis_entretien (entretien_id, magasin_code, magasin_libelle, animateur, collaborateur_matricule, collaborateur_nom, type_entretien, libelle, echeance, reunion_id)
+VALUES (NULL, ?, ?, ?, NULL, 'Équipe', 'reunion_mensuelle', ?, ?, ?)`
+).bind(String(magasin.code), magasin.libelle, magasin.animateur || null, (p.titre + ' — ' + p.objectif).slice(0, 300), p.echeance, reunionId));
+}
+if (stmts.length) await env.DB.batch(stmts);
+} catch (e) { console.error('Suivis / sujets traités de la réunion non enregistrés :', e); }
+// Mails : magasin + AR.
+const subject = `Réunion mensuelle — ${libelle} — ${magasin.libelle} — ${formatDateFr(date)}`;
+const bodyHtml = `<div style="font-family:Arial,sans-serif;"><h2 style="color:#E2231A;">Réunion mensuelle</h2><p><b>Magasin :</b> ${escapeHtml(magasin.libelle)}</p><p><b>Type :</b> ${escapeHtml(libelle)}</p><p><b>Animée par :</b> ${escapeHtml(remplipar)}${poste ? ' (' + escapeHtml(poste) + ')' : ''} — <b>Date :</b> ${escapeHtml(formatDateFr(date))}</p><p><b>Présents (${presents.length}) :</b> ${escapeHtml(presents.map(p => p.nom).join(', '))}</p>${absents.length ? `<p><b>Absents :</b> ${escapeHtml(absents.join(', '))}</p>` : ''}<p><b>Points traités :</b></p><ul>${points.map(p => `<li>${escapeHtml(p.titre)}${p.objectif ? ' — objectif : ' + escapeHtml(p.objectif) + (p.echeance ? ' (' + escapeHtml(formatDateFr(p.echeance)) + ')' : '') : ''}</li>`).join('')}</ul>${b.pdfBase64 ? '<p>Le compte-rendu complet, signé par les présents, est joint au format PDF.</p>' : ''}</div>`;
+const destinataires = [magasin.email, magasin.animateurEmail].filter((x, i, a) => x && a.indexOf(x) === i);
+for (const to of destinataires) {
+try {
+if (b.pdfBase64) await zimbraSendMailWithAttachment(env, { to, subject, bodyHtml, pdfBase64: b.pdfBase64, filename: b.pdfFilename || 'Reunion.pdf' });
+else await zimbraSendMail(env, { to, subject, bodyHtml });
+} catch (e) { console.error('Échec envoi mail réunion mensuelle à ' + to + ' :', e); }
+}
+return new Response(JSON.stringify({ ok: true, id: reunionId, lancementId }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur enregistrement réunion : ' + String(e), 500, corsHeaders);
+}
+}
+
+// Une réunion complète (avec signatures) pour régénérer son PDF depuis l'historique.
+if (url.pathname === '/reunion-get') {
+const storeToken = request.headers.get('X-Store-Token');
+if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!sessionAr) return jsonError('Session animateur invalide ou expirée, reconnecte-toi.', 401, corsHeaders);
+try {
+await ensureReunionTables(env);
+const id = Number(url.searchParams.get('id'));
+const r = await env.DB.prepare(`SELECT * FROM reunions_magasin WHERE id = ?`).bind(id).first();
+if (!r) return jsonError('Réunion introuvable', 404, corsHeaders);
+if (sessionAr !== 'ALL') {
+const stores = await getMagasinsServerSide();
+const m = stores.find(s => String(s.code) === String(r.magasin_code));
+if (!m || m.animateur !== sessionAr) return jsonError('Accès non autorisé à ce magasin', 403, corsHeaders);
+}
+const sig = await lireSignaturesReunion(env, r);
+const presents = JSON.parse(r.presents_json || '[]').map((p, i) => ({ ...p, signature: sig[i] || null }));
+return new Response(JSON.stringify({ ok: true, reunion: { ...r, signatures_json: undefined, presents, absents: JSON.parse(r.absents_json || '[]'), points: JSON.parse(r.points_json || '[]'), libelle: libelleReunion(r) } }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+} catch (e) {
+return jsonError('Erreur lecture réunion : ' + String(e), 500, corsHeaders);
+}
+}
+
 // Suppression d'un entretien ou d'un lancement de journée depuis l'Historique
 // de Suivi Managers (29/09) — réservée à Olivier (session AR 'ALL'), pour
 // retirer les doublons. Supprimer un entretien supprime aussi les suivis datés
@@ -7024,7 +7360,7 @@ if (sessionAr !== 'ALL') return jsonError('Suppression réservée à Olivier', 4
 try {
 const { kind, id } = await request.json();
 const n = Number(id);
-if (!Number.isInteger(n) || n <= 0 || !['entretien', 'lancement'].includes(kind)) return jsonError('Paramètres invalides', 400, corsHeaders);
+if (!Number.isInteger(n) || n <= 0 || !['entretien', 'lancement', 'reunion'].includes(kind)) return jsonError('Paramètres invalides', 400, corsHeaders);
 let suivisSupprimes = 0;
 if (kind === 'entretien') {
 try {
@@ -7033,6 +7369,19 @@ suivisSupprimes = (r && r.meta && r.meta.changes) || 0;
 } catch (e) { /* table absente : rien à supprimer */ }
 const del = await env.DB.prepare(`DELETE FROM entretiens_manager WHERE id = ?`).bind(n).run();
 if (!(del && del.meta && del.meta.changes)) return jsonError('Entretien introuvable', 404, corsHeaders);
+} else if (kind === 'reunion') {
+// Réunion supprimée : son lancement lié, ses objectifs datés, ses sujets
+// marqués traités (ils redeviennent à traiter) et ses signatures archivées.
+await ensureReunionTables(env);
+const del = await env.DB.prepare(`DELETE FROM reunions_magasin WHERE id = ?`).bind(n).run();
+if (!(del && del.meta && del.meta.changes)) return jsonError('Réunion introuvable', 404, corsHeaders);
+const r1 = await env.DB.prepare(`DELETE FROM suivis_entretien WHERE reunion_id = ?`).bind(n).run();
+suivisSupprimes = (r1 && r1.meta && r1.meta.changes) || 0;
+await env.DB.batch([
+env.DB.prepare(`DELETE FROM lancements_journee WHERE reunion_id = ?`).bind(n),
+env.DB.prepare(`DELETE FROM reunion_sujets_traites WHERE reunion_id = ?`).bind(n),
+]);
+if (env.ARCHIVES) { try { await env.ARCHIVES.prepare(`DELETE FROM reunion_signatures WHERE reunion_id = ?`).bind(n).run(); } catch (e) {} }
 } else {
 const del = await env.DB.prepare(`DELETE FROM lancements_journee WHERE id = ?`).bind(n).run();
 if (!(del && del.meta && del.meta.changes)) return jsonError('Lancement introuvable', 404, corsHeaders);
@@ -7083,6 +7432,16 @@ const { results } = await env.DB.prepare(
 `SELECT * FROM lancements_journee WHERE 1=1${sc.sql} ORDER BY date DESC, id DESC LIMIT ?`
 ).bind(...sc.binds, limit).all();
 result.lancements = results.map(r => ({ ...r, presents_json: JSON.parse(r.presents_json || '[]'), mensuel_json: JSON.parse(r.mensuel_json || '{}') }));
+}
+if (type !== 'entretiens' && type !== 'lancements') {
+try {
+await ensureReunionTables(env);
+const sc = scopeClause('magasin_code');
+const { results } = await env.DB.prepare(
+`SELECT id, magasin_code, magasin_libelle, animateur, type_reunion, sous_type, intitule, rempli_par, date, presents_json, absents_json, points_json FROM reunions_magasin WHERE 1=1${sc.sql} ORDER BY date DESC, id DESC LIMIT ?`
+).bind(...sc.binds, limit).all();
+result.reunions = (results || []).map(r => ({ id: r.id, magasin_code: r.magasin_code, magasin_libelle: r.magasin_libelle, rempli_par: r.rempli_par, date: r.date, libelle: libelleReunion(r), nb_presents: JSON.parse(r.presents_json || '[]').length, nb_absents: JSON.parse(r.absents_json || '[]').length, nb_points: JSON.parse(r.points_json || '[]').length }));
+} catch (e) { result.reunions = []; console.error('Historique réunions :', e); }
 }
 
 return new Response(JSON.stringify({ ok: true, ...result }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
