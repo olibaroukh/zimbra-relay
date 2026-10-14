@@ -5402,6 +5402,12 @@ const magasinLibelle = data?.magasin?.libelle || null;
 if (!magasinCode || !data?.date) {
 return new Response('Champs requis manquants (magasin.code, date)', { status: 400, headers: corsHeaders });
 }
+// 14/10 : l'appli réessaie et renvoie les bilans en attente → anti-doublon sur
+// l'identifiant unique (uid) posé par l'appli au premier envoi.
+if (data.uid) {
+const deja = await env.DB.prepare(`SELECT id FROM bilans WHERE magasin_code = ? AND date = ? AND json_extract(data_json, '$.uid') = ? LIMIT 1`).bind(String(magasinCode), data.date, String(data.uid)).first();
+if (deja) return new Response(JSON.stringify({ ok: true, id: deja.id, deja: true }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
 await env.DB.prepare(
 `INSERT INTO bilans (magasin_code, magasin_libelle, ar, date, passage, humeur, ca_mensuel, ca_annuel, renta, data_json)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
