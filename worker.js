@@ -1182,6 +1182,61 @@ return promise;
 function viderMemoD1() { _memoD1.clear(); }
 const MEMO_SANTE_MS = 5 * 60 * 1000;
 const MEMO_ACTIVITE_MS = 60 * 1000;
+
+// ---------- Cache persistant des calculs réseau dans D1 (14/10) ----------
+// Le cache mémoire seul ne suffisait pas (75 % du quota le 14/10 à midi) :
+// chaque instance du Worker démarre vide, et Suivi Managers recalculait le
+// score mensuel de tout le réseau à chaque ouverture. Les calculs réseau
+// (score santé hebdo, aperçu du score mensuel) sont désormais stockés en JSON
+// dans la table cache_calculs : une lecture = 1 ligne, recalcul au plus toutes
+// les CACHE_CALC_MS, pour tout le réseau d'un coup.
+// Invalidation : saisies qui changent fortement le score (bilan, PEDLV, imports
+// RH, Kaizen clôturé, évaluation équipe, fermetures, neutralisations) et début
+// de chaque cron. Les saisies fréquentes (lancements, entretiens, cases Kaizen,
+// observations) apparaissent au plus tard CACHE_CALC_MS après.
+const CACHE_CALC_MS = 5 * 60 * 1000;
+const ROUTES_INVALIDANT_CALCULS = new Set(['/store-bilan', '/store-stats', '/rh-import/effectif', '/rh-import/agenda', '/sante-mensuel', '/kaizen-lock', '/kaizen-import-historique', '/kaizen-import-historique-rollback', '/evaluation/controle', '/evaluation/correction', '/evaluation/supprimer-controle', '/fermetures-reseau']);
+let _cacheCalculsOk = false;
+async function ensureCacheCalculs(env) {
+if (_cacheCalculsOk || !env.DB) return;
+await env.DB.prepare(`CREATE TABLE IF NOT EXISTS cache_calculs (cle TEXT PRIMARY KEY, json TEXT NOT NULL, maj INTEGER NOT NULL)`).run();
+_cacheCalculsOk = true;
+}
+function calculMisEnCache(env, cle, ttlMs, fn) {
+return memoD1('calc:' + cle, 60 * 1000, async () => {
+try {
+await ensureCacheCalculs(env);
+const row = await env.DB.prepare('SELECT json, maj FROM cache_calculs WHERE cle = ?').bind(cle).first();
+if (row && (Date.now() - Number(row.maj)) < ttlMs) return JSON.parse(row.json);
+} catch (e) { console.error('cache_calculs lecture :', e); }
+const val = await fn();
+try {
+const json = JSON.stringify(val);
+if (json.length < 1800000) {
+await env.DB.prepare('INSERT INTO cache_calculs (cle, json, maj) VALUES (?, ?, ?) ON CONFLICT(cle) DO UPDATE SET json = excluded.json, maj = excluded.maj').bind(cle, json, Date.now()).run();
+} else console.error('cache_calculs : ' + cle + ' trop volumineux (' + json.length + ' car.), non stocké');
+} catch (e) { console.error('cache_calculs écriture :', e); }
+return val;
+});
+}
+async function invaliderCalculs(env) {
+viderMemoD1();
+if (!env.DB) return;
+try { await ensureCacheCalculs(env); await env.DB.prepare('DELETE FROM cache_calculs').run(); } catch (e) { console.error('cache_calculs purge :', e); }
+}
+// Aperçu du score mensuel (mois non encore calculé) : calculé pour tout le
+// réseau une fois, puis filtré sur les magasins demandés (le calcul est
+// strictement magasin par magasin, aucun effet de la liste sur le résultat).
+async function apercuSanteMensuel(env, mois, stores) {
+let tous = null;
+try { tous = await getMagasinsServerSide(); } catch (e) {}
+if (tous && tous.length) {
+const all = await calculMisEnCache(env, 'sante-mensuel-apercu:' + mois, CACHE_CALC_MS, () => collecterSanteMensuel(env, mois, tous, null, { apercu: true }));
+const parCode = new Map(all.map(l => [l.code, l]));
+if (stores.every(st => parCode.has(st.code))) return stores.map(st => parCode.get(st.code));
+}
+return collecterSanteMensuel(env, mois, stores, null, { apercu: true });
+}
 // Dernier dimanche 20h00 UTC écoulé, au format datetime('now') de SQLite.
 function weeklyCutoffSql() {
 const now = new Date();
@@ -2701,7 +2756,7 @@ else {
 // Aperçu indicatif (mois en cours ou mois non encore calculé) : rien n'est enregistré.
 apercu = true; poids = await getHealthWeights(env);
 const neutra = await santeNeutralisationsAppliquees(env, mois);
-lignes = (await collecterSanteMensuel(env, mois, stores, null, { apercu: true })).map(l => {
+lignes = (await apercuSanteMensuel(env, mois, stores)).map(l => {
 const n = neutra[l.code] || {};
 return { ...l, neutralisations: n, ...santeScoreFinal(l.sous, l.exclusions, new Set(Object.keys(n)), poids) };
 });
@@ -3089,7 +3144,20 @@ const entretiensLancementsMap = await getEntretiensLancementsMap(env);
 return { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap };
 });
 }
+// Score santé hebdo : calculé pour tout le réseau et mis en cache (14/10), puis
+// filtré sur le périmètre demandé en gardant l'ordre du tri réseau.
 async function buildStoreHealthResults(env, scope) {
+let tous = null;
+try { tous = await getMagasinsServerSide(); } catch (e) {}
+if (tous && tous.length) {
+const all = await calculMisEnCache(env, 'sante-hebdo:' + new Date().toISOString().slice(0, 10), CACHE_CALC_MS, () => buildStoreHealthResultsD1(env, tous));
+const codes = new Set(scope.map(st => st.code));
+const connus = new Set(all.map(r => r.code));
+if ([...codes].every(c => connus.has(c))) return all.filter(r => codes.has(r.code));
+}
+return buildStoreHealthResultsD1(env, scope);
+}
+async function buildStoreHealthResultsD1(env, scope) {
 const todayISO = new Date().toISOString().slice(0, 10);
 const { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap } = await chargerDonneesSante(env);
 
@@ -4537,6 +4605,8 @@ export default {
 async fetch(request, env) {
 chargerClesSession(env);
 if (request.method === 'POST') viderMemoD1();
+const _cheminRequete = new URL(request.url).pathname;
+if (request.method === 'POST' && ROUTES_INVALIDANT_CALCULS.has(_cheminRequete)) await invaliderCalculs(env);
 await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
@@ -5592,7 +5662,7 @@ const moisCourant = parisTodayIso().slice(0, 7);
 let enCours = null;
 try {
 const neutra = await santeNeutralisationsAppliquees(env, moisCourant);
-const [l] = await collecterSanteMensuel(env, moisCourant, [store], null, { apercu: true });
+const [l] = await apercuSanteMensuel(env, moisCourant, [store]);
 if (l) {
 const n = neutra[code] || {};
 enCours = { mois: moisCourant, poids, sous: l.sous, exclusions: l.exclusions, entrees: l.entrees, neutralisations: n,
@@ -8323,7 +8393,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 
 async scheduled(event, env, ctx) {
 chargerClesSession(env);
-viderMemoD1();
+await invaliderCalculs(env);
 await chargerObjectifsReseauPedlv();
 const cron = event.cron;
 if (cron === '0 14 * * SUN' || cron === '0 7 * * SUN') {
