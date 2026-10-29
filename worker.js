@@ -4720,6 +4720,39 @@ return new Response('Méthode non autorisée', { status: 405, headers: corsHeade
 }
 
 try {
+// ── Import Cosium (extension Chrome « Envoyer à PEDLV ») — ajouté le 29/10/2026 ──
+// /cosium-import     : l'extension dépose les 5 CSV du mois en cours → renvoie un id
+// /cosium-import-get : PEDLV récupère les CSV à partir de cet id (POST, pour ne pas toucher au filtre GET)
+// Conservation 48 h, purge à chaque nouveau dépôt (pas de cron supplémentaire).
+if (url.pathname === '/cosium-import' || url.pathname === '/cosium-import-get') {
+if (request.headers.get('X-Store-Token') !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+if (!env.DB) return jsonError('Base D1 non liée au Worker', 500, corsHeaders);
+const jsonCosium = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+const bodyCosium = await request.json().catch(() => null);
+if (!bodyCosium) return jsonError('Corps JSON invalide', 400, corsHeaders);
+
+if (url.pathname === '/cosium-import') {
+const typesCosium = ['pos', 'stats_opt', 'stats_audio', 'ca_audio', 'pm1'];
+const filesCosium = bodyCosium.files || {};
+for (const t of typesCosium) {
+if (typeof filesCosium[t] !== 'string' || !filesCosium[t].includes(';')) return jsonError('Fichier manquant ou invalide : ' + t, 400, corsHeaders);
+}
+const payloadCosium = JSON.stringify({ files: filesCosium, periode: bodyCosium.periode || null });
+if (payloadCosium.length > 1500000) return jsonError('Fichiers trop volumineux', 413, corsHeaders);
+const idCosium = crypto.randomUUID();
+const maintenant = Date.now();
+await env.DB.prepare('DELETE FROM cosium_imports WHERE created_at < ?').bind(maintenant - 48 * 3600 * 1000).run();
+await env.DB.prepare('INSERT INTO cosium_imports (id, created_at, payload) VALUES (?, ?, ?)').bind(idCosium, maintenant, payloadCosium).run();
+return jsonCosium({ ok: true, id: idCosium });
+}
+
+const idDemande = String(bodyCosium.id || '');
+if (!/^[0-9a-f-]{36}$/.test(idDemande)) return jsonError('Identifiant invalide', 400, corsHeaders);
+const ligneCosium = await env.DB.prepare('SELECT payload, created_at FROM cosium_imports WHERE id = ?').bind(idDemande).first();
+if (!ligneCosium) return jsonError('Import introuvable ou expiré (48 h) — relance « Envoyer à PEDLV » depuis Cosium', 404, corsHeaders);
+return jsonCosium({ ok: true, created_at: ligneCosium.created_at, ...JSON.parse(ligneCosium.payload) });
+}
+
 if (url.pathname === '/upload') {
 const token = request.headers.get('X-Zimbra-Auth-Token');
 if (!token) {
