@@ -5559,12 +5559,12 @@ query += ' AND magasin_code = ?'; binds.push(magasinCode);
 } else if (codesParam.length) {
 const codes = allowedCodes ? codesParam.filter(c => allowedCodes.includes(c)) : codesParam;
 if (!codes.length) return emptyResp();
-query += ' AND magasin_code IN (' + codes.map(() => '?').join(',') + ')';
-binds.push(...codes);
+query += ' AND magasin_code IN (SELECT value FROM json_each(?))';
+binds.push(JSON.stringify(codes));
 } else if (allowedCodes) {
 if (!allowedCodes.length) return emptyResp();
-query += ' AND magasin_code IN (' + allowedCodes.map(() => '?').join(',') + ')';
-binds.push(...allowedCodes);
+query += ' AND magasin_code IN (SELECT value FROM json_each(?))';
+binds.push(JSON.stringify(allowedCodes));
 }
 if (from) { query += ' AND date >= ?'; binds.push(from); }
 if (to) { query += ' AND date <= ?'; binds.push(to); }
@@ -6262,9 +6262,9 @@ let equipeTachesAgregees = [];
 try {
 const annee = anneeCouranteEval();
 const codes = scope.map(s => s.code);
-const placeholders = codes.map(() => '?').join(',');
-const { results: notes } = await env.DB.prepare(`SELECT magasin_code, tache, note FROM notes_equipe WHERE magasin_code IN (${placeholders}) AND annee = ?`).bind(...codes, annee).all();
-const { results: fiches } = await env.DB.prepare(`SELECT magasin_code, tache, responsable FROM responsables_taches WHERE magasin_code IN (${placeholders})`).bind(...codes).all();
+const codesJson = JSON.stringify(codes);
+const { results: notes } = await env.DB.prepare(`SELECT magasin_code, tache, note FROM notes_equipe WHERE magasin_code IN (SELECT value FROM json_each(?)) AND annee = ?`).bind(codesJson, annee).all();
+const { results: fiches } = await env.DB.prepare(`SELECT magasin_code, tache, responsable FROM responsables_taches WHERE magasin_code IN (SELECT value FROM json_each(?))`).bind(codesJson).all();
 const notesByTache = {};
 notes.forEach(n => { (notesByTache[n.tache] ??= {}); (notesByTache[n.tache][n.magasin_code] ??= []).push(n.note); });
 const fichesByTache = {};
@@ -6297,14 +6297,14 @@ const sureffectif = results.filter(r => r.effectif && r.effectif.delta !== null 
 let tauxAbsenteismeMoyen = null;
 try {
 const codesAbsScope = scope.map(s => s.code);
-const placeholdersAbs = codesAbsScope.map(() => '?').join(',');
+const codesAbsJson = JSON.stringify(codesAbsScope);
 const { results: absRows } = await env.DB.prepare(`
 SELECT es.mois as mois, SUM(a.jours_groupe_a * es.poids) as groupe_a_pondere, SUM(a.jours_ouvres_theoriques * es.poids) as theo_pondere
 FROM rh_effectif_site_mensuel es
 JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
-WHERE es.site_reconnu = 1 AND es.code_site IN (${placeholdersAbs})
+WHERE es.site_reconnu = 1 AND es.code_site IN (SELECT value FROM json_each(?))
 GROUP BY es.mois ORDER BY es.mois ASC
-`).bind(...codesAbsScope).all();
+`).bind(codesAbsJson).all();
 const notesMensuelles = absRows
 .filter(r => r.theo_pondere > 0)
 .map(r => Math.max(0, 100 - (r.groupe_a_pondere / r.theo_pondere) * 100));
