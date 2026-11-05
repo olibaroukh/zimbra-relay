@@ -868,6 +868,51 @@ return !u.includes('@') || u === OLIVIER_EMAIL;
 // reconnexion suffit) — ils ont pu être délivrés à tort.
 const SESSION_TOKEN_VERSION = 2;
 
+// ---------- IDdigital : écrans de diffusion des succursales (05/11/2026) ----------
+// Clé API dans le secret Cloudflare IDDIGITAL_API_KEY (jamais dans le code). Le jeton obtenu avec POST /v1.0/login
+// est gardé en mémoire 30 min. L'adresse exacte de l'API et le format de connexion ne figurant pas dans le manuel,
+// la première connexion essaie les variantes plausibles et retient celle qui répond.
+const IDD_BASES = ['https://iddigital.accessfrance.eu/api', 'https://iddigital.accessfrance.eu', 'https://api.iddigital.accessfrance.eu'];
+let _idd = { base: null, variante: null, token: null, at: 0 };
+function iddChercherJeton(o, prof = 0) {
+if (!o || prof > 4) return null;
+if (typeof o === 'string') return null;
+for (const k of Object.keys(o)) { const v = o[k]; if (typeof v === 'string' && /token|jwt/i.test(k) && v.length > 10) return v; }
+for (const k of Object.keys(o)) { const t = typeof o[k] === 'object' ? iddChercherJeton(o[k], prof + 1) : null; if (t) return t; }
+return null;
+}
+async function iddConnexion(env, forcer) {
+if (!env.IDDIGITAL_API_KEY) throw new Error('Secret IDDIGITAL_API_KEY absent de zimbra-relay');
+if (!forcer && _idd.token && Date.now() - _idd.at < 30 * 60000) return _idd;
+const k = env.IDDIGITAL_API_KEY, essais = [];
+const variantes = [
+['json apiKey', () => ({ headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ apiKey: k }) })],
+['json api_key', () => ({ headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ api_key: k }) })],
+['json key', () => ({ headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ key: k }) })],
+['en-tête X-API-KEY', () => ({ headers: { 'X-API-KEY': k, Accept: 'application/json' } })],
+['formulaire apiKey', () => { const f = new FormData(); f.append('apiKey', k); return { headers: { Accept: 'application/json' }, body: f }; }],
+];
+const bases = _idd.base ? [_idd.base].concat(IDD_BASES.filter(b => b !== _idd.base)) : IDD_BASES;
+for (const base of bases) for (const [nom, fab] of variantes) {
+try {
+const r = await fetch(base + '/v1.0/login', { method: 'POST', ...fab() });
+const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
+const jeton = j ? iddChercherJeton(j) : null;
+essais.push(`${base} · ${nom} → ${r.status}`);
+if (r.ok && jeton) { _idd = { base, variante: nom, token: jeton, at: Date.now() }; return _idd; }
+} catch (e) { essais.push(`${base} · ${nom} → ${String(e && e.message || e).slice(0, 60)}`); }
+}
+const err = new Error('Connexion IDdigital impossible'); err.essais = essais; throw err;
+}
+async function iddMagasins(env) {
+const c = await iddConnexion(env);
+const r = await fetch(`${c.base}/${encodeURIComponent(c.token)}/v1.0/getStore`, { headers: { Accept: 'application/json' } });
+const j = await r.json().catch(() => null);
+if (!r.ok) throw new Error('getStore : HTTP ' + r.status);
+const liste = Array.isArray(j) ? j : (j && (j.stores || j.data || j.result || j.magasins)) || [];
+return { base: c.base, variante: c.variante, magasins: Array.isArray(liste) ? liste : [], brut: Array.isArray(liste) ? null : j };
+}
+
 // ---------- Rappel mensuel aux AR : critères manuels Managers Leaders / Magasins d'Excellence (05/11/2026) ----------
 // Le 1er de chaque mois, chaque animateur reçoit la liste de ses succursales et le lien vers l'écran de saisie de Suivi Stats.
 async function envoyerRappelMlme(env) {
@@ -9154,6 +9199,11 @@ const o = out[String(r.code)] = out[String(r.code)] || { femmes: 0, hommes: 0, a
 if (/^(f|femme|feminin|mme|madame)/.test(g)) o.femmes += r.n || 0; else if (/^(h|m|homme|masculin|monsieur)/.test(g)) o.hommes += r.n || 0; else o.autres += r.n || 0;
 }
 return { mois: moisRh, magasins: out };
+}
+async iddigitalTest() {
+// Test de connexion IDdigital : connexion + liste des magasins accessibles ; rien n'est envoyé aux écrans
+try { const m = await iddMagasins(this.env); return { ok: true, base: m.base, variante: m.variante, nb: m.magasins.length, magasins: m.magasins.slice(0, 400), brut: m.brut }; }
+catch (e) { return { ok: false, erreur: String(e && e.message || e), essais: e && e.essais ? e.essais : null }; }
 }
 async listePins() {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
