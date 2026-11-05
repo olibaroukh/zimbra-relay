@@ -7643,6 +7643,28 @@ const parCle = {};
 for (const row of results) parCle[matKey(row.matricule)] = row;
 const collaborateurs = {};
 for (const m of matricules) { const row = parCle[matKey(m)]; if (row) collaborateurs[m] = { ...row, matricule: m }; }
+// 05/11/2026 : priorité aux stats Suivi Stats (cumul à fin du dernier mois enregistré), puis PEDLV, puis saisie
+if (_suiviBinding && typeof _suiviBinding.statsVendeurs === 'function') {
+try {
+const sv = await _suiviBinding.statsVendeurs(matricules);
+const MOIS_FR = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+const lib = sv && sv.mois ? 'Suivi Stats – cumul à fin ' + MOIS_FR[+String(sv.mois).slice(5) - 1] + ' ' + String(sv.mois).slice(0, 4) : 'Suivi Stats';
+const r1 = v => (v === null || v === undefined || !isFinite(Number(v))) ? null : Math.round(Number(v) * 10) / 10;
+const r0 = v => (v === null || v === undefined || !isFinite(Number(v))) ? null : Math.round(Number(v));
+for (const m of matricules) {
+const s = sv && sv.parMatricule && sv.parMatricule[m]; if (!s) continue;
+const a = s.audio || {};
+const v = { pmOpt: r0(s.panier), nbVenteOpt: r0(s.ndv), txConcretOpt: r1(s.tc), sop: r1(s.sop), packConfortPct: r1(s.pcPct), packConfortPm: r0(s.pcEur),
+mdc: r1(s.mdc), pm1erePaire: r0(s.pm1), pctTestAuditif: r1(s.depistage), transitionPct: r1(s.transition),
+pmAudio: r0(a.panier), txConcretAudio: r1(a.tc), ap4: r1(a.garantie), caAccessoiresPct: r1(a.ventesAdd), pmProthese: r0(a.pmProthese), ouiezen: r1(a.ouiezen), ar3: r1(s.arHG) };
+const verrou = Object.keys(v).filter(k => v[k] !== null);
+if (!verrou.length) continue;
+const base = collaborateurs[m] || { matricule: m };
+for (const k of verrou) base[k] = v[k];
+collaborateurs[m] = { ...base, matricule: m, periode: sv.mois, source: 'suivi-stats', sourceLibelle: lib, champsVerrouilles: verrou };
+}
+} catch (e) { console.error('Stats Suivi Stats indisponibles pour /collab-stats :', e); }
+}
 return new Response(JSON.stringify({ ok: true, collaborateurs }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture stats collaborateur : ' + String(e), 500, corsHeaders);
@@ -7713,10 +7735,19 @@ const b = await env.DB.prepare(
 ).bind(String(store.code)).first();
 if (b) { positionnementAnnuel = toNumOrNull(b.ca_annuel); positionnementAnnuelDate = b.date || null; }
 } catch (e) {}
+// 05/11/2026 : positionnement annuel mesuré (Suivi Stats, cumul à fin du dernier mois) prioritaire sur la saisie du bilan
+let positionnementAnnuelSource = positionnementAnnuel != null ? 'bilan' : null;
+try {
+if (_suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+const sv = await _suiviBinding.statsMagasin(magasinCode);
+const N = sv && sv.magasin && sv.magasin.N, m = sv && Number(String(sv.mois || '').slice(5));
+if (N && N.P != null && N.O && m) { positionnementAnnuel = Math.round(N.P * 12 / m / (N.O * 1000) * 1000) / 10; positionnementAnnuelDate = sv.mois; positionnementAnnuelSource = 'suivi-stats'; }
+}
+} catch (e) {}
 
 const statsMap = await getStoreStatsMap(env);
 const row = statsMap[normalizeName(store.libelle)];
-if (!row) return new Response(JSON.stringify({ ok: true, periode: null, positionnementAnnuel, positionnementAnnuelDate }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+if (!row) return new Response(JSON.stringify({ ok: true, periode: null, positionnementAnnuel, positionnementAnnuelDate, positionnementAnnuelSource }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 const caTotal = row.ca_total != null ? Number(row.ca_total) : null;
 const caAudio = row.ca_audio != null ? Number(row.ca_audio) : null;
@@ -7738,7 +7769,7 @@ ok: true, periode: row.periode || null,
 caTotal: toEurosRounded(caTotal), caAudio: toEurosRounded(caAudio), caOpt: toEurosRounded(row.ca_opt != null ? Number(row.ca_opt) : null),
 nbVenteOpt: row.nb_vente_opt != null ? Number(row.nb_vente_opt) : null,
 protheses: row.protheses_vendues != null ? Number(row.protheses_vendues) : null,
-positionnementMensuel, caAudioMagPct, positionnementAnnuel, positionnementAnnuelDate,
+positionnementMensuel, caAudioMagPct, positionnementAnnuel, positionnementAnnuelDate, positionnementAnnuelSource,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture stats mensuelles magasin : ' + String(e), 500, corsHeaders);
