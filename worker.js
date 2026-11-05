@@ -5338,6 +5338,27 @@ const parMatricule = {};
 for (const r of (statsRows || [])) parMatricule[matKey(r.matricule)] = r;
 for (const c of collaborateurs) c.stats = parMatricule[matKey(c.matricule)] || null;
 }
+// Stats par collaborateur « depuis janvier » : Suivi Stats (export Cosium par vendeur, cumul à fin du dernier mois enregistré)
+let suiviMois = null;
+if (collaborateurs.length && _suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+try {
+const sv = await _suiviBinding.statsMagasin(code);
+if (sv && Array.isArray(sv.equipe)) {
+suiviMois = sv.mois || null;
+const mk = m => String(m).trim().replace(/^0+/, '');
+const idx = {}; sv.equipe.forEach(p => { if (p && p.matricule && p.s) idx[mk(p.matricule)] = p.s; });
+const r1 = v => (v === null || v === undefined || !isFinite(Number(v))) ? null : Math.round(Number(v) * 10) / 10;
+for (const c of collaborateurs) {
+const s = idx[mk(c.matricule)]; if (!s) { c.suivi = null; continue; }
+const a = s.audio || {};
+c.suivi = { nbVenteOpt: s.ndv != null ? Math.round(s.ndv) : null, txConcretOpt: r1(s.tc), sop: r1(s.sop), packConfortPct: r1(s.pcPct),
+packConfortPm: s.pcEur != null ? Math.round(s.pcEur) : null, mdc: r1(s.mdc), pctTestAuditif: r1(s.depistage),
+nbProtheses: a.protheses != null ? Math.round(a.protheses) : null, pmAudio: a.panier != null ? Math.round(a.panier) : null,
+txConcretAudio: r1(a.tc), ap4: r1(a.garantie), caAccessoiresPct: r1(a.ventesAdd) };
+}
+}
+} catch (e) { console.error('Stats collaborateurs Suivi Stats indisponibles :', e); }
+}
 
 // 3. Tâches actives Évaluation Équipe + note du magasin (moyenne des 3 meilleures)
 const annee = anneeCouranteEval();
@@ -5392,7 +5413,7 @@ kaizenCumulAnnuel: h ? h.kaizenCumulAnnuel : null,
 niveauEquipe: h ? h.niveauEquipe : null,
 objectifNiveauEquipe: OBJECTIF_NIVEAU_EQUIPE,
 },
-collaborateurs: { moisRh: moisRh || null, liste: collaborateurs },
+collaborateurs: { moisRh: moisRh || null, liste: collaborateurs, suiviMois },
 taches,
 dernierBilan: { date: h ? h.lastBilanDate : null, actions },
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
