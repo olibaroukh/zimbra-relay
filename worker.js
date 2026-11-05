@@ -1,3 +1,4 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
 // Relais Zimbra pour bilan-passage + repartition_stocks.html — Olivier Baroukh / Optical Center
 // Ce Worker retransmet les appels SOAP et l'upload de pièce jointe vers Zimbra
 // à côté serveur, pour contourner le blocage CORS du navigateur.
@@ -4727,7 +4728,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 }
 }
 
-export default {
+const GESTIONNAIRE_PRINCIPAL = {
 async fetch(request, env) {
 _suiviBinding = env.SUIVI || null; _suiviEnvDB = env.DB || null;
 chargerClesSession(env);
@@ -8895,3 +8896,21 @@ bodyText: `Le trigger "${cron}" a déclenché scheduled() mais ne correspond à 
 }
 }
 };
+export default GESTIONNAIRE_PRINCIPAL;
+
+// ---------- Lien interne pour Suivi Stats (05/11/2026) ----------
+// Accessible uniquement par une liaison de service (suivi-stats-api › RELAIS), jamais depuis internet.
+// Suivi Stats y lit, côté serveur, les avis Google, le score santé et les bilans de passage, sans clé partagée
+// ni session AR dans le navigateur : l'appel interne reprend les mêmes calculs que les routes HTTP, en vue réseau complète.
+export class RelaisInterne extends WorkerEntrypoint {
+async _appel(chemin) {
+chargerClesSession(this.env);
+const ses = await createArSession('ALL');
+const req = new Request('https://relais.interne' + chemin, { headers: { 'X-Store-Token': STORE_SECRET, 'X-AR-Session': ses } });
+const r = await GESTIONNAIRE_PRINCIPAL.fetch(req, this.env);
+return r.json();
+}
+googleRatings() { return this._appel('/google-ratings'); }
+santeMensuel(mois) { return this._appel('/sante-mensuel?mois=' + encodeURIComponent(String(mois || ''))); }
+bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeURIComponent(String(du || '')) + '&to=' + encodeURIComponent(String(au || ''))); }
+}
