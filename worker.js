@@ -927,6 +927,24 @@ out.push({ code: s.code, libelle: s.libelle, ok: true, envoye, erreur, pin: envo
 return out;
 }
 
+// Poste d'animateur réseau / Siège (05/11/2026) : après une connexion Zimbra personnelle, le poste reçoit une session
+// longue (90 jours) au nom de l'animateur (ALL pour Olivier) ; plus de demande de code PIN magasin sur ce poste.
+const ANIMATEUR_SESSION_TTL_MS = 90 * 24 * 3600 * 1000;
+async function createAnimateurSession(ar) {
+const payload = JSON.stringify({ t: 'anim', ar, exp: Date.now() + ANIMATEUR_SESSION_TTL_MS, v: SESSION_TOKEN_VERSION });
+const b64 = btoa(unescape(encodeURIComponent(payload)));
+return b64 + '.' + await hmacSign(b64);
+}
+// Renvoie le nom de l'animateur (ou 'ALL') si la session de poste est valide, sinon null
+async function verifyAnimateurSession(token) {
+if (!AR_SESSION_SECRET || !token || !String(token).includes('.')) return null;
+const [b64, sig] = String(token).split('.');
+if (sig !== await hmacSign(b64)) return null;
+let p; try { p = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch (e) { return null; }
+if (!p || p.t !== 'anim' || !p.ar || !(p.exp > Date.now()) || p.v !== SESSION_TOKEN_VERSION) return null;
+return p.ar;
+}
+
 async function createArSession(ar) {
 const payload = JSON.stringify({ ar, exp: Date.now() + AR_SESSION_TTL_MS, v: SESSION_TOKEN_VERSION });
 const b64 = btoa(unescape(encodeURIComponent(payload)));
@@ -4834,7 +4852,7 @@ await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session, X-Accueil-Session, X-Magasin-Session',
+'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session, X-Accueil-Session, X-Magasin-Session, X-Animateur-Session',
 'Access-Control-Max-Age': '86400',
 };
 
@@ -4843,6 +4861,13 @@ return new Response(null, { status: 204, headers: corsHeaders });
 }
 
 const url = new URL(request.url);
+
+// Enregistrement d'un poste d'animateur réseau / Siège : session AR (connexion Zimbra) → session de poste 90 jours
+if (request.method === 'POST' && url.pathname === '/poste-animateur') {
+const ar = await verifyArSession(request.headers.get('X-AR-Session'));
+if (!ar) return new Response(JSON.stringify({ ok: false, error: 'Connexion animateur requise' }), { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+return new Response(JSON.stringify({ ok: true, token: await createAnimateurSession(ar), ar, expiresInMs: ANIMATEUR_SESSION_TTL_MS }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
 
 // Connexion d'un poste magasin : code magasin + code PIN → session magasin (≈ 13 mois). 5 essais ratés → 15 min de blocage.
 if (request.method === 'POST' && url.pathname === '/magasin-login') {
@@ -5001,8 +5026,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders }
 }
 
 if (url.pathname === '/ar-login') {
-const storeToken = request.headers.get('X-Store-Token');
-if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+// 05/11/2026 : la clé partagée n'est plus exigée ici — l'identification Zimbra personnelle suffit (préparation de la fermeture de la clé)
 
 const { zimbraUser, zimbraPass } = await request.json();
 if (!zimbraUser || !zimbraPass) return jsonError('Identifiant et mot de passe requis', 400, corsHeaders);
