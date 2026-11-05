@@ -4740,7 +4740,15 @@ const url = new URL(request.url);
 
 // Référentiel unique au format de l'ancien magasins.csv (mêmes colonnes, séparateur ;), pour les applis terrain.
 if (request.method === 'GET' && url.pathname === '/referentiel/magasins.csv') {
-const rows = await getMagasinsServerSide();
+const rows = (await getMagasinsServerSide()).map(r => ({ ...r }));
+// Effectifs : la saisie de l'AR au dernier bilan de passage prime (les effectifs bougent en cours de mois) ;
+// à défaut, effectifs de l'export RH du dernier mois de Suivi Stats.
+const effBilans = {};
+try {
+const r = await env.DB.prepare('SELECT b.magasin_code AS code, b.data_json AS data FROM bilans b JOIN (SELECT magasin_code, MAX(date) AS d FROM bilans GROUP BY magasin_code) x ON b.magasin_code = x.magasin_code AND b.date = x.d').all();
+for (const l of (r.results || [])) { try { const mg = (JSON.parse(l.data || '{}').magasin) || {}; const o = toNumOrNull(mg.eff_opt), a = toNumOrNull(mg.eff_audio); if (o !== null || a !== null) effBilans[String(l.code)] = { o, a }; } catch (e) {} }
+} catch (e) { console.error('Effectifs des bilans indisponibles :', e); }
+for (const r0 of rows) { const r = r0; const b = effBilans[String(r.code)]; if (b) { if (b.o !== null) r.effOpt = b.o; if (b.a !== null) r.effAudio = b.a; } }
 const nb = v => v == null || v === '' ? '' : String(v).replace('.', ',');
 const on = v => v ? 'oui' : 'non';
 const propre = v => String(v == null ? '' : v).replace(/[;\r\n]/g, ' ');
