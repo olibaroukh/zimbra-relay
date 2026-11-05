@@ -9248,7 +9248,10 @@ catch (e) { return { ok: false, code, erreur: String(e && e.message || e) }; }
 }
 async iddigitalTest() {
 // Test de connexion IDdigital : connexion + liste des magasins accessibles ; rien n'est envoyé aux écrans
-try { const m = await iddMagasins(this.env); return { ok: true, base: m.base, variante: m.variante, nb: m.magasins.length, magasins: m.magasins.slice(0, 400), brut: m.brut }; }
+try { const m = await iddMagasins(this.env);
+// Sections du Bilan AR (pour savoir où ranger le bilan de passage)
+let sections = null; try { const c = await iddConnexion(this.env); const r = await fetch(`${c.base}/${encodeURIComponent(c.token)}/v1.0/bilan-ar/sections`, { headers: { Accept: 'application/json' } }); sections = await r.json().catch(() => ({ statut: r.status })); } catch (e) { sections = { erreur: String(e && e.message || e) }; }
+return { ok: true, base: m.base, variante: m.variante, nb: m.magasins.length, magasins: m.magasins.slice(0, 400), brut: m.brut, sections }; }
 catch (e) { return { ok: false, erreur: String(e && e.message || e), essais: e && e.essais ? e.essais : null }; }
 }
 async listePins() {
