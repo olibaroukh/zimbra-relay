@@ -6834,8 +6834,15 @@ if (url.pathname === '/rh-import/effectif') {
       await env.DB.batch(stmts.slice(i, i + 400));
     }
 
+    // 05/11/2026 : export RH unique — le fichier complet (tout le groupe) est aussi transmis à Suivi Stats,
+    // qui n'a plus besoin qu'on le lui redépose. Jamais bloquant pour l'import de bilan-passage.
+    let suiviStats = null;
+    if (_suiviBinding && typeof _suiviBinding.deposerRh === 'function') {
+      try { suiviStats = await _suiviBinding.deposerRh(mois, rows); }
+      catch (e) { suiviStats = { ok: false, erreur: String(e && e.message || e) }; }
+    }
     return new Response(JSON.stringify({
-      ok: true, mois, nbSalaries, nbSansSite, nbHorsReseau, nbImportes,
+      ok: true, mois, nbSalaries, nbSansSite, nbHorsReseau, nbImportes, suiviStats,
       sitesNonReconnus: [...sitesNonReconnus.entries()].map(([code, nom]) => ({ code, nom })),
     }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
   } catch (e) {
