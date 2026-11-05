@@ -1578,8 +1578,39 @@ lancement: lancement ? { date: isoJour(lancement.date), detail: lancement.rempli
 accompagnement: accomp ? { date: isoJour(accomp.date), detail: [accomp.statut, accomp.itinerant].filter(Boolean).join(' — ') || null } : null,
 };
 
-let kpis = null;
-if (stats) {
+let kpis = null, sourceKpis = null, suiviInfo = null;
+// Priorité (consigne d'Olivier, 05/11/2026) : 1) Suivi Stats (cumul à fin du dernier mois enregistré),
+// 2) Pour être dans le vert (extraction Cosium « à date »), 3) saisie manuelle de l'AR.
+try {
+if (_suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+const sv = await _suiviBinding.statsMagasin(code);
+const N = sv && sv.magasin && sv.magasin.N;
+if (N && N.P != null) {
+await chargerObjectifsReseauPedlv();
+const v = x => (x === null || x === undefined || !isFinite(Number(x))) ? null : Number(x);
+const m = Number(String(sv.mois || '').slice(5)) || null;
+const pm = v(N.V), tc = v(N.AF), objPm = OBJECTIFS_RESEAU_PEDLV.pm, objTc = OBJECTIFS_RESEAU_PEDLV.tc;
+const pcEur = v(N.AE), pcPct = v(N.AD);
+const posAnnuel = (v(N.P) !== null && v(N.O) && m) ? N.P * 12 / m / (N.O * 1000) * 100 : null;
+kpis = {
+sop: r1(v(N.AC)), tc: r1(tc), pcPct: r1(pcPct), pcEur: pcEur !== null ? Math.round(pcEur) : null,
+panierMoyen: pm !== null ? Math.round(pm) : null, mdc: r1(v(N.AN)), audioDepistage: r1(v(N.BE)), venteAdd: r1(v(N.BC)),
+nbProtheses: v(N.AX), ndv: v(N.U), pmPaire1: v(N.W) !== null ? Math.round(N.W) : null, lukkas: r1(v(N.AP)),
+pmProthese: v(N.AZ) !== null ? Math.round(N.AZ) : null, pmVenteAudio: v(N.AY) !== null ? Math.round(N.AY) : null, sap: r1(v(N.BA)),
+seuilPerf: (pm !== null && tc !== null && objPm && objTc) ? r1(pm * tc / (objPm * objTc) * 100) : null,
+seuilPc: (pcEur !== null && pcPct !== null) ? Math.round(pcEur * pcPct) : null,
+positionnementAnnuel: posAnnuel !== null ? r1(posAnnuel) : null,
+// Positionnement mensuel : Suivi Stats n'a pas le mois en cours → extraction « à date » si elle existe
+positionnement: stats ? r1(nb(stats.positionnement)) : null,
+};
+sourceKpis = 'suivi-stats';
+const MOIS_FR = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+suiviInfo = { mois: sv.mois, libelle: m ? 'Suivi Stats – cumul à fin ' + MOIS_FR[m - 1] + ' ' + String(sv.mois).slice(0, 4) : 'Suivi Stats' };
+}
+}
+} catch (e) { console.error('Pré-remplissage Suivi Stats indisponible :', e); }
+if (!kpis && stats) {
+sourceKpis = 'pedlv';
 await chargerObjectifsReseauPedlv();
 const pm = nb(stats.panier_moyen), tc = nb(stats.taux_tc);
 const objPm = OBJECTIFS_RESEAU_PEDLV.pm, objTc = OBJECTIFS_RESEAU_PEDLV.tc;
@@ -1617,6 +1648,8 @@ return {
 magasin: { code: store.code, libelle: store.libelle },
 stats: stats ? { date: isoJour(stats.created_at), periode: stats.periode || null, dateExtraction: stats.date_extraction || null } : null,
 kpis,
+sourceKpis,
+sourceLibelle: sourceKpis === 'suivi-stats' ? suiviInfo.libelle : sourceKpis === 'pedlv' ? ('Pour être dans le vert – extraction' + (stats && stats.periode ? ' ' + stats.periode : '')) : null,
 derniereActivite,
 };
 }
