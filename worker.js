@@ -9140,6 +9140,21 @@ const { results } = await this.env.DB.prepare('SELECT magasin_code AS code, SUM(
 const out = {}; (results || []).forEach(r => { if (r.code) out[String(r.code)] = Math.round((r.total || 0) * 10) / 10; });
 return out;
 }
+async rhGenre(mois) {
+// Hommes / femmes par magasin d'après le dernier import RH (bilan-passage) au plus tard au mois indiqué ; multi-sites au prorata
+const m = String(mois || ''); if (!/^\d{4}-\d{2}$/.test(m)) return { mois: null, magasins: {} };
+const { results } = await this.env.DB.prepare(`SELECT es.mois AS mois, es.code_site AS code, em.genre AS genre, SUM(es.poids) AS n
+FROM rh_effectif_site_mensuel es JOIN rh_effectif_mensuel em ON em.mois = es.mois AND em.matricule = es.matricule
+WHERE es.site_reconnu = 1 AND es.mois = (SELECT MAX(mois) FROM rh_effectif_site_mensuel WHERE mois <= ?)
+GROUP BY es.mois, es.code_site, em.genre`).bind(m).all();
+const out = {}; let moisRh = null;
+for (const r of (results || [])) {
+moisRh = r.mois; const g = String(r.genre || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const o = out[String(r.code)] = out[String(r.code)] || { femmes: 0, hommes: 0, autres: 0 };
+if (/^(f|femme|feminin|mme|madame)/.test(g)) o.femmes += r.n || 0; else if (/^(h|m|homme|masculin|monsieur)/.test(g)) o.hommes += r.n || 0; else o.autres += r.n || 0;
+}
+return { mois: moisRh, magasins: out };
+}
 async listePins() {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
 await pinTable(this.env);
