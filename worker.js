@@ -905,7 +905,15 @@ if (r.ok && jeton) { _idd = { base, variante: nom, token: jeton, at: Date.now() 
 const err = new Error('Connexion IDdigital impossible'); err.essais = essais; throw err;
 }
 // Envoi d'un PDF vers l'écran d'un magasin (code Suivi Stats) dans une catégorie IDdigital
-const IDD_TYPES = ['stats-tracking', 'month-stats'];
+const IDD_TYPES = ['stats-tracking', 'month-stats', 'bilan-ar', 'task-sheet'];
+// Bilan AR : le bilan de passage va dans la section « Animateur Réseau » (consigne d'Olivier, 05/11/2026)
+async function iddSectionAnimateur(c) {
+const r = await fetch(`${c.base}/${encodeURIComponent(c.token)}/v1.0/bilan-ar/sections`, { headers: { Accept: 'application/json' } });
+const j = await r.json().catch(() => null);
+const liste = Array.isArray(j) ? j : (j && (j.sections || j.data || j.result)) || [];
+const s = (Array.isArray(liste) ? liste : []).find(x => /animateur/i.test(JSON.stringify(x)));
+return s ? (s.id ?? s.sectionId ?? s.ID ?? null) : null;
+}
 async function iddEnvoyer(env, type, code, pdfB64, nomFichier) {
 if (!IDD_TYPES.includes(type)) throw new Error('Catégorie non prise en charge : ' + type);
 const c = await iddConnexion(env);
@@ -917,7 +925,10 @@ const id = s.id ?? s.storeId;
 const octets = Uint8Array.from(atob(String(pdfB64 || '')), x => x.charCodeAt(0));
 if (!octets.length) throw new Error('PDF vide');
 if (octets.length > 25 * 1024 * 1024) throw new Error('PDF de plus de 25 Mo');
-const envoi = async jeton => { const f = new FormData(); f.append('form', JSON.stringify({ storeIds: [id] }));
+const champs = { storeIds: [id] };
+if (type === 'bilan-ar') { const sec = await iddSectionAnimateur(c); if (sec == null) return { ok: false, code: cible, erreur: 'section « Animateur Réseau » introuvable dans IDdigital' }; champs.sectionId = sec; champs.section = sec; }
+if (type === 'task-sheet') champs.accessType = 1; // fiche de tâches : fichier 1
+const envoi = async jeton => { const f = new FormData(); f.append('form', JSON.stringify(champs));
 f.append('file', new Blob([octets], { type: 'application/pdf' }), nomFichier || (type + '-' + cible + '.pdf'));
 return fetch(`${c.base}/${encodeURIComponent(jeton)}/v1.0/${type}`, { method: 'POST', headers: { Accept: 'application/json' }, body: f }); };
 let r = await envoi(c.token);
@@ -4957,7 +4968,7 @@ return new Response(JSON.stringify({ ok: true, token: await createAnimateurSessi
 // Envoi d'un document sur l'écran IDdigital d'un magasin depuis une appli terrain (PEDLV, bilan, évaluation…).
 // Autorisé : poste du magasin (session magasin, uniquement son magasin) ou animateur / Siège (session AR ou poste
 // d'animateur, magasins de son périmètre). Catégories ouvertes : voir IDD_TYPES_APPLIS.
-const IDD_TYPES_APPLIS = ['month-stats'];
+const IDD_TYPES_APPLIS = ['month-stats', 'bilan-ar', 'task-sheet'];
 if (request.method === 'POST' && url.pathname === '/iddigital/envoyer') {
 const j = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 try {
