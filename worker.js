@@ -7735,10 +7735,19 @@ const b = await env.DB.prepare(
 ).bind(String(store.code)).first();
 if (b) { positionnementAnnuel = toNumOrNull(b.ca_annuel); positionnementAnnuelDate = b.date || null; }
 } catch (e) {}
+// 05/11/2026 : positionnement annuel mesuré (Suivi Stats, cumul à fin du dernier mois) prioritaire sur la saisie du bilan
+let positionnementAnnuelSource = positionnementAnnuel != null ? 'bilan' : null;
+try {
+if (_suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+const sv = await _suiviBinding.statsMagasin(magasinCode);
+const N = sv && sv.magasin && sv.magasin.N, m = sv && Number(String(sv.mois || '').slice(5));
+if (N && N.P != null && N.O && m) { positionnementAnnuel = Math.round(N.P * 12 / m / (N.O * 1000) * 1000) / 10; positionnementAnnuelDate = sv.mois; positionnementAnnuelSource = 'suivi-stats'; }
+}
+} catch (e) {}
 
 const statsMap = await getStoreStatsMap(env);
 const row = statsMap[normalizeName(store.libelle)];
-if (!row) return new Response(JSON.stringify({ ok: true, periode: null, positionnementAnnuel, positionnementAnnuelDate }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+if (!row) return new Response(JSON.stringify({ ok: true, periode: null, positionnementAnnuel, positionnementAnnuelDate, positionnementAnnuelSource }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
 const caTotal = row.ca_total != null ? Number(row.ca_total) : null;
 const caAudio = row.ca_audio != null ? Number(row.ca_audio) : null;
@@ -7760,7 +7769,7 @@ ok: true, periode: row.periode || null,
 caTotal: toEurosRounded(caTotal), caAudio: toEurosRounded(caAudio), caOpt: toEurosRounded(row.ca_opt != null ? Number(row.ca_opt) : null),
 nbVenteOpt: row.nb_vente_opt != null ? Number(row.nb_vente_opt) : null,
 protheses: row.protheses_vendues != null ? Number(row.protheses_vendues) : null,
-positionnementMensuel, caAudioMagPct, positionnementAnnuel, positionnementAnnuelDate,
+positionnementMensuel, caAudioMagPct, positionnementAnnuel, positionnementAnnuelDate, positionnementAnnuelSource,
 }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur lecture stats mensuelles magasin : ' + String(e), 500, corsHeaders);
