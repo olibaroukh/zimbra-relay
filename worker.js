@@ -4954,6 +4954,27 @@ if (!ar) return new Response(JSON.stringify({ ok: false, error: 'Connexion anima
 return new Response(JSON.stringify({ ok: true, token: await createAnimateurSession(ar), ar, expiresInMs: ANIMATEUR_SESSION_TTL_MS }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 }
 
+// Envoi d'un document sur l'écran IDdigital d'un magasin depuis une appli terrain (PEDLV, bilan, évaluation…).
+// Autorisé : poste du magasin (session magasin, uniquement son magasin) ou animateur / Siège (session AR ou poste
+// d'animateur, magasins de son périmètre). Catégories ouvertes : voir IDD_TYPES_APPLIS.
+const IDD_TYPES_APPLIS = ['month-stats'];
+if (request.method === 'POST' && url.pathname === '/iddigital/envoyer') {
+const j = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+try {
+const b = await request.json().catch(() => ({}));
+const code = String(b.code || '').trim().replace(/^0+(?=\d)/, ''), type = String(b.type || '');
+if (!code || !b.pdf || !IDD_TYPES_APPLIS.includes(type)) return j({ ok: false, error: 'Magasin, catégorie ou PDF manquant' }, 400);
+const mag = await verifyMagasinSession(env, request.headers.get('X-Magasin-Session'));
+let ar = null;
+if (!mag) ar = (await verifyAnimateurSession(request.headers.get('X-Animateur-Session'))) || (await verifyArSession(request.headers.get('X-AR-Session')));
+if (!mag && !ar) return j({ ok: false, error: 'Poste non enregistré : connexion magasin ou animateur requise' }, 401);
+if (mag && mag !== code) return j({ ok: false, error: 'Ce poste est enregistré pour un autre magasin' }, 403);
+if (ar && ar !== 'ALL') { const s = (await getMagasinsServerSide()).find(x => x.code === code); if (!s || s.animateur !== ar) return j({ ok: false, error: 'Magasin hors de votre périmètre' }, 403); }
+const r = await iddEnvoyer(env, type, code, String(b.pdf), b.nom ? String(b.nom) : null);
+return j(r, r.ok ? 200 : 502);
+} catch (e) { return j({ ok: false, error: 'Envoi impossible : ' + String(e && e.message || e) }, 500); }
+}
+
 // Connexion d'un poste magasin : code magasin + code PIN → session magasin (≈ 13 mois). 5 essais ratés → 15 min de blocage.
 if (request.method === 'POST' && url.pathname === '/magasin-login') {
 const j = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
