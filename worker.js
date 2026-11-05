@@ -7656,7 +7656,7 @@ const s = sv && sv.parMatricule && sv.parMatricule[m]; if (!s) continue;
 const a = s.audio || {};
 const v = { pmOpt: r0(s.panier), nbVenteOpt: r0(s.ndv), txConcretOpt: r1(s.tc), sop: r1(s.sop), packConfortPct: r1(s.pcPct), packConfortPm: r0(s.pcEur),
 mdc: r1(s.mdc), pm1erePaire: r0(s.pm1), pctTestAuditif: r1(s.depistage), transitionPct: r1(s.transition),
-pmAudio: r0(a.panier), txConcretAudio: r1(a.tc), ap4: r1(a.garantie), caAccessoiresPct: r1(a.ventesAdd), pmProthese: r0(a.pmProthese), ouiezen: r1(a.ouiezen) };
+pmAudio: r0(a.panier), txConcretAudio: r1(a.tc), ap4: r1(a.garantie), caAccessoiresPct: r1(a.ventesAdd), pmProthese: r0(a.pmProthese), ouiezen: r1(a.ouiezen), ar3: r1(s.arHG) };
 const verrou = Object.keys(v).filter(k => v[k] !== null);
 if (!verrou.length) continue;
 const base = collaborateurs[m] || { matricule: m };
