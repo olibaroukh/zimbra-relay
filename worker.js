@@ -320,8 +320,7 @@ manager: idxManager >= 0 ? (cols[idxManager] || '').trim() : '',
 objectifAnnuel: Number.isFinite(objAnnuelNum) ? objAnnuelNum : null,
 };
 }).filter(r => r.code);
-_magasinsCache = rows;
-_magasinsCacheAt = now;
+if (rows.length) { _magasinsCache = rows; _magasinsCacheAt = now; } // une liste vide (fichier absent) n'est pas gardée en mémoire
 return rows;
 }
 
@@ -868,6 +867,63 @@ return !u.includes('@') || u === OLIVIER_EMAIL;
 // accès à Formation / Direction émis avant ce correctif sont refusés (une
 // reconnexion suffit) — ils ont pu être délivrés à tort.
 const SESSION_TOKEN_VERSION = 2;
+
+// ---------- Accès magasin par code PIN (05/11/2026) ----------
+// Un code à 6 chiffres par magasin, envoyé par mail sur la boîte du magasin, saisi une fois par poste dans les applis
+// utilisées en magasin (PEDLV, Suivi magasin, Kaizen). Le code n'est jamais stocké en clair (empreinte SHA-256 salée).
+// Régénérer un code invalide les sessions des postes déjà connectés (numéro de version).
+const MAGASIN_SESSION_TTL_MS = 400 * 24 * 3600 * 1000;
+async function pinTable(env) {
+await env.DB.prepare('CREATE TABLE IF NOT EXISTS magasin_pins (code TEXT PRIMARY KEY, pin_hash TEXT, version INTEGER, cree_le TEXT, envoye_a TEXT, echecs INTEGER DEFAULT 0, bloque_jusqua TEXT)').run();
+}
+async function empreintePin(code, pin) {
+const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode((AR_SESSION_SECRET || '') + '|' + code + '|' + pin));
+return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function createMagasinSession(code, version) {
+const payload = JSON.stringify({ t: 'mag', mag: String(code), pv: version, exp: Date.now() + MAGASIN_SESSION_TTL_MS });
+const b64 = btoa(unescape(encodeURIComponent(payload)));
+return b64 + '.' + await hmacSign(b64);
+}
+// Renvoie le code magasin si la session est valide (signature, expiration, code PIN toujours en vigueur), sinon null
+async function verifyMagasinSession(env, token) {
+if (!AR_SESSION_SECRET || !token || !String(token).includes('.')) return null;
+const [b64, sig] = String(token).split('.');
+if (sig !== await hmacSign(b64)) return null;
+let p; try { p = JSON.parse(decodeURIComponent(escape(atob(b64)))); } catch (e) { return null; }
+if (!p || p.t !== 'mag' || !p.mag || !(p.exp > Date.now())) return null;
+try { await pinTable(env); const r = await env.DB.prepare('SELECT version FROM magasin_pins WHERE code = ?').bind(p.mag).first(); if (!r || r.version !== p.pv) return null; } catch (e) { return null; }
+return p.mag;
+}
+async function genererPinsMagasins(env, codes, envoyer) {
+await pinTable(env);
+const stores = await getMagasinsServerSide();
+const out = [];
+for (const code of codes || []) {
+const s = stores.find(x => x.code === String(code));
+if (!s) { out.push({ code, ok: false, erreur: 'magasin inconnu' }); continue; }
+const pin = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
+const prec = await env.DB.prepare('SELECT version FROM magasin_pins WHERE code = ?').bind(s.code).first();
+const version = ((prec && prec.version) || 0) + 1, maintenant = new Date().toISOString();
+let envoye = null, erreur = null;
+if (envoyer) {
+if (!s.email) erreur = 'pas d’e-mail magasin dans le référentiel';
+else {
+try {
+await zimbraSendMail(env, { to: s.email, subject: `Code d’accès des applis magasin – ${s.libelle}`,
+bodyText: `Bonjour,\n\nVoici le code d’accès du magasin ${s.libelle} (code ${s.code}) pour les applis utilisées en magasin : Pour être dans le vert, Suivi magasin et Kaizen.\n\nCode PIN : ${pin}\n\nIl se saisit une seule fois sur chaque poste ou tablette du magasin, avec le code magasin ${s.code}. Ne le communiquez pas en dehors de l’équipe du magasin.\n\nOlivier`,
+bodyHtml: `<p>Bonjour,</p><p>Voici le code d’accès du magasin <b>${s.libelle}</b> (code ${s.code}) pour les applis utilisées en magasin : <b>Pour être dans le vert</b>, <b>Suivi magasin</b> et <b>Kaizen</b>.</p><p style="font-size:22px;letter-spacing:4px"><b>${pin}</b></p><p>Il se saisit <b>une seule fois</b> sur chaque poste ou tablette du magasin, avec le code magasin <b>${s.code}</b>. Ne le communiquez pas en dehors de l’équipe du magasin.</p><p>Olivier</p>` });
+envoye = s.email;
+} catch (e) { erreur = 'envoi du mail : ' + String(e && e.message || e); }
+}
+}
+await env.DB.prepare('INSERT INTO magasin_pins (code, pin_hash, version, cree_le, envoye_a, echecs, bloque_jusqua) VALUES (?, ?, ?, ?, ?, 0, NULL) ON CONFLICT(code) DO UPDATE SET pin_hash = excluded.pin_hash, version = excluded.version, cree_le = excluded.cree_le, envoye_a = excluded.envoye_a, echecs = 0, bloque_jusqua = NULL')
+.bind(s.code, await empreintePin(s.code, pin), version, maintenant, envoye).run();
+// Le code n'est renvoyé (une seule fois, à l'administrateur) que s'il n'a pas pu partir par mail
+out.push({ code: s.code, libelle: s.libelle, ok: true, envoye, erreur, pin: envoye ? null : pin });
+}
+return out;
+}
 
 async function createArSession(ar) {
 const payload = JSON.stringify({ ar, exp: Date.now() + AR_SESSION_TTL_MS, v: SESSION_TOKEN_VERSION });
@@ -4781,6 +4837,28 @@ return new Response(null, { status: 204, headers: corsHeaders });
 }
 
 const url = new URL(request.url);
+
+// Connexion d'un poste magasin : code magasin + code PIN → session magasin (≈ 13 mois). 5 essais ratés → 15 min de blocage.
+if (request.method === 'POST' && url.pathname === '/magasin-login') {
+const j = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+try {
+const b = await request.json().catch(() => ({}));
+const code = String(b.code || '').trim().replace(/^0+(?=\d)/, ''), pin = String(b.pin || '').trim();
+if (!code || !/^\d{6}$/.test(pin)) return j({ ok: false, error: 'Code magasin et code PIN à 6 chiffres requis' }, 400);
+await pinTable(env);
+const r = await env.DB.prepare('SELECT pin_hash, version, echecs, bloque_jusqua FROM magasin_pins WHERE code = ?').bind(code).first();
+if (!r) return j({ ok: false, error: 'Aucun code PIN pour ce magasin : demandez-le à votre animateur réseau' }, 401);
+if (r.bloque_jusqua && r.bloque_jusqua > new Date().toISOString()) return j({ ok: false, error: 'Trop d’essais : réessayez dans quelques minutes' }, 429);
+if (await empreintePin(code, pin) !== r.pin_hash) {
+const e = (r.echecs || 0) + 1;
+await env.DB.prepare('UPDATE magasin_pins SET echecs = ?, bloque_jusqua = ? WHERE code = ?').bind(e >= 5 ? 0 : e, e >= 5 ? new Date(Date.now() + 15 * 60000).toISOString() : null, code).run();
+return j({ ok: false, error: 'Code PIN incorrect' }, 401);
+}
+await env.DB.prepare('UPDATE magasin_pins SET echecs = 0, bloque_jusqua = NULL WHERE code = ?').bind(code).run();
+const s = (await getMagasinsServerSide()).find(x => x.code === code);
+return j({ ok: true, token: await createMagasinSession(code, r.version), magasin: { code, libelle: s ? s.libelle : '' } });
+} catch (e) { return j({ ok: false, error: 'Erreur de connexion : ' + String(e) }, 500); }
+}
 
 // Référentiel unique au format de l'ancien magasins.csv (mêmes colonnes, séparateur ;), pour les applis terrain.
 if (request.method === 'GET' && url.pathname === '/referentiel/magasins.csv') {
@@ -9005,4 +9083,15 @@ return r.json();
 googleRatings() { return this._appel('/google-ratings'); }
 santeMensuel(mois) { return this._appel('/sante-mensuel?mois=' + encodeURIComponent(String(mois || ''))); }
 bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeURIComponent(String(du || '')) + '&to=' + encodeURIComponent(String(au || ''))); }
+async listePins() {
+chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
+await pinTable(this.env);
+const { results } = await this.env.DB.prepare('SELECT code, version, cree_le, envoye_a FROM magasin_pins').all();
+const idx = {}; (results || []).forEach(r => idx[r.code] = r);
+return (await getMagasinsServerSide()).map(s => ({ code: s.code, libelle: s.libelle, email: s.email || '', animateur: s.animateur || '', pin: idx[s.code] ? { version: idx[s.code].version, creeLe: idx[s.code].cree_le, envoyeA: idx[s.code].envoye_a } : null }));
+}
+async genererPins(codes, envoyer) {
+chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
+return genererPinsMagasins(this.env, codes, envoyer !== false);
+}
 }
