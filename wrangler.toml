@@ -18,6 +18,12 @@ binding = "ARCHIVES"
 database_name = "rapports-archives"
 database_id = "dd609057-c4f3-41d4-8ec9-c9bb14da8ede"
 
+# Lien interne vers Suivi Stats (référentiel unique, chiffres magasins) – jamais exposé sur internet
+[[services]]
+binding = "SUIVI"
+service = "suivi-stats-api"
+entrypoint = "SuiviStatsInterne"
+
 [[r2_buckets]]
 binding = "KAIZEN_PHOTOS"
 bucket_name = "kaizen-photos"

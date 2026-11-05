@@ -235,9 +235,31 @@ const STORE_STATS_NAME_ALIASES = [
 let _magasinsCache = null;
 let _magasinsCacheAt = 0;
 
+// Référentiel unique (05/11/2026) : les magasins viennent de Suivi Stats par le lien interne SUIVI
+// (liaison de service vers suivi-stats-api, point d'entrée SuiviStatsInterne). Animateur = « Animateur terrain »
+// sinon l'AR ; effectifs, effectif théorique et objectif annuel = données mesurées du dernier mois enregistré.
+// Repli automatique sur magasins.csv si le lien est indisponible.
+let _suiviBinding = null;
+async function referentielDepuisSuivi() {
+if (!_suiviBinding || typeof _suiviBinding.referentielTerrain !== 'function') return null;
+try {
+const r = await _suiviBinding.referentielTerrain();
+if (!r || !Array.isArray(r.magasins) || !r.magasins.length) return null;
+return r.magasins.map(m => ({
+code: String(m.code || '').trim(), libelle: m.libelle || '', animateur: m.animateur || '', animateurEmail: m.animateurEmail || '',
+email: m.email || '', googlePlaceId: m.googlePlaceId || '', concept: m.concept || '', meubleVitrine: !!m.meubleVitrine,
+presentoirVerres: !!m.presentoirVerres, alsaceMoselle: !!m.alsaceMoselle, effTheo: m.effTheo == null ? null : m.effTheo,
+manager: m.manager || '', objectifAnnuel: m.objectifAnnuel == null ? null : m.objectifAnnuel,
+effOpt: m.effOpt, effAudio: m.effAudio, statut: m.statut || '', source: 'suivi-stats',
+})).filter(x => x.code);
+} catch (e) { console.error('Référentiel Suivi Stats indisponible, repli sur magasins.csv :', e); return null; }
+}
+
 async function getMagasinsServerSide() {
 const now = Date.now();
 if (_magasinsCache && (now - _magasinsCacheAt) < 10 * 60 * 1000) return _magasinsCache;
+const depuisSuivi = await referentielDepuisSuivi();
+if (depuisSuivi) { _magasinsCache = depuisSuivi; _magasinsCacheAt = now; return depuisSuivi; }
 const resp = await fetch(MAGASINS_CSV_URL + '?v=' + now);
 const text = await resp.text();
 const lines = text.split(/\r?\n/).filter(Boolean);
@@ -4697,6 +4719,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 
 export default {
 async fetch(request, env) {
+_suiviBinding = env.SUIVI || null;
 chargerClesSession(env);
 if (request.method === 'POST') viderMemoD1();
 const _cheminRequete = new URL(request.url).pathname;
@@ -4714,6 +4737,17 @@ return new Response(null, { status: 204, headers: corsHeaders });
 }
 
 const url = new URL(request.url);
+
+// Référentiel unique au format de l'ancien magasins.csv (mêmes colonnes, séparateur ;), pour les applis terrain.
+if (request.method === 'GET' && url.pathname === '/referentiel/magasins.csv') {
+const rows = await getMagasinsServerSide();
+const nb = v => v == null || v === '' ? '' : String(v).replace('.', ',');
+const on = v => v ? 'oui' : 'non';
+const propre = v => String(v == null ? '' : v).replace(/[;\r\n]/g, ' ');
+const lignes = ['code;libelle;email;manager;eff_opt;eff_audio;eff_theo;animateur;animateur_email;google_place_id;concept;meuble_vitrine;presentoir_verres;statut;Objectif Annuel;alsace_moselle']
+.concat(rows.map(r => [r.code, r.libelle, r.email, r.manager, nb(r.effOpt), nb(r.effAudio), nb(r.effTheo), r.animateur, r.animateurEmail, r.googlePlaceId, r.concept, on(r.meubleVitrine), on(r.presentoirVerres), r.statut || '', nb(r.objectifAnnuel), on(r.alsaceMoselle)].map(propre).join(';')));
+return new Response(lignes.join('\n') + '\n', { headers: { ...corsHeaders, 'Content-Type': 'text/csv; charset=utf-8', 'Cache-Control': 'no-store', 'X-Source-Referentiel': rows.length && rows[0].source === 'suivi-stats' ? 'suivi-stats' : 'magasins.csv' } });
+}
 
 if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau' || url.pathname === '/brouillons' || url.pathname === '/brouillon-get' || url.pathname === '/reunion-sujets' || url.pathname === '/reunion-sujets-admin' || url.pathname === '/reunion-get'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
@@ -8809,6 +8843,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 },
 
 async scheduled(event, env, ctx) {
+_suiviBinding = env.SUIVI || null;
 chargerClesSession(env);
 await invaliderCalculs(env, false);
 await chargerObjectifsReseauPedlv();
