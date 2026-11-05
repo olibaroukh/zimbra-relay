@@ -239,7 +239,7 @@ let _magasinsCacheAt = 0;
 // (liaison de service vers suivi-stats-api, point d'entrée SuiviStatsInterne). Animateur = « Animateur terrain »
 // sinon l'AR ; effectifs, effectif théorique et objectif annuel = données mesurées du dernier mois enregistré.
 // Repli automatique sur magasins.csv si le lien est indisponible.
-let _suiviBinding = null;
+let _suiviBinding = null, _suiviEnvDB = null, _secoursEcritAt = 0;
 async function referentielDepuisSuivi() {
 if (!_suiviBinding || typeof _suiviBinding.referentielTerrain !== 'function') return null;
 try {
@@ -259,7 +259,17 @@ async function getMagasinsServerSide() {
 const now = Date.now();
 if (_magasinsCache && (now - _magasinsCacheAt) < 10 * 60 * 1000) return _magasinsCache;
 const depuisSuivi = await referentielDepuisSuivi();
-if (depuisSuivi) { _magasinsCache = depuisSuivi; _magasinsCacheAt = now; return depuisSuivi; }
+if (depuisSuivi) {
+_magasinsCache = depuisSuivi; _magasinsCacheAt = now;
+// Copie de secours en base (au plus une écriture par heure) : sert si Suivi Stats est momentanément indisponible
+if (_suiviEnvDB && (!_secoursEcritAt || now - _secoursEcritAt > 3600e3)) { _secoursEcritAt = now;
+try { await _suiviEnvDB.prepare('CREATE TABLE IF NOT EXISTS referentiel_secours (id INTEGER PRIMARY KEY, data TEXT, maj TEXT)').run();
+await _suiviEnvDB.prepare('INSERT INTO referentiel_secours (id, data, maj) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data, maj = excluded.maj').bind(JSON.stringify(depuisSuivi), new Date().toISOString()).run(); } catch (e) { console.error('Copie de secours du référentiel :', e); } }
+return depuisSuivi;
+}
+// Repli 1 : dernière copie du référentiel unique conservée en base
+if (_suiviEnvDB) { try { const s = await _suiviEnvDB.prepare('SELECT data FROM referentiel_secours WHERE id = 1').first(); if (s && s.data) { const rows = JSON.parse(s.data); if (rows.length) { _magasinsCache = rows; _magasinsCacheAt = now; return rows; } } } catch (e) {} }
+// Repli 2 (ancien fonctionnement, tant que le fichier existe encore) : magasins.csv
 const resp = await fetch(MAGASINS_CSV_URL + '?v=' + now);
 const text = await resp.text();
 const lines = text.split(/\r?\n/).filter(Boolean);
@@ -4719,7 +4729,7 @@ console.error(`Échec de l'ENVOI de l'alerte cron pour ${jobName} (en plus de l'
 
 export default {
 async fetch(request, env) {
-_suiviBinding = env.SUIVI || null;
+_suiviBinding = env.SUIVI || null; _suiviEnvDB = env.DB || null;
 chargerClesSession(env);
 if (request.method === 'POST') viderMemoD1();
 const _cheminRequete = new URL(request.url).pathname;
@@ -8851,7 +8861,7 @@ headers: { 'Content-Type': 'application/json', ...corsHeaders },
 },
 
 async scheduled(event, env, ctx) {
-_suiviBinding = env.SUIVI || null;
+_suiviBinding = env.SUIVI || null; _suiviEnvDB = env.DB || null;
 chargerClesSession(env);
 await invaliderCalculs(env, false);
 await chargerObjectifsReseauPedlv();
