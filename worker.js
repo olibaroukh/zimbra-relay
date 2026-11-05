@@ -926,13 +926,17 @@ const octets = Uint8Array.from(atob(String(pdfB64 || '')), x => x.charCodeAt(0))
 if (!octets.length) throw new Error('PDF vide');
 if (octets.length > 25 * 1024 * 1024) throw new Error('PDF de plus de 25 Mo');
 const champs = { storeIds: [id] };
-if (type === 'bilan-ar') { const sec = await iddSectionAnimateur(c); if (sec == null) return { ok: false, code: cible, erreur: 'section « Animateur Réseau » introuvable dans IDdigital' }; champs.sectionId = sec; champs.section = sec; }
-if (type === 'task-sheet') champs.accessType = 1; // fiche de tâches : fichier 1
+// Bilan AR et fiche de tâches : valeur 1 (Bilan AR = section « Animateur Réseau » ; fiche de tâches = fichier 1), consigne d'Olivier du 05/11
+if (type === 'bilan-ar' || type === 'task-sheet') champs.accessType = 1;
 const envoi = async jeton => { const f = new FormData(); f.append('form', JSON.stringify(champs));
 f.append('file', new Blob([octets], { type: 'application/pdf' }), nomFichier || (type + '-' + cible + '.pdf'));
 return fetch(`${c.base}/${encodeURIComponent(jeton)}/v1.0/${type}`, { method: 'POST', headers: { Accept: 'application/json' }, body: f }); };
 let r = await envoi(c.token);
 if (r.status === 401) { const c2 = await iddConnexion(env, true); r = await envoi(c2.token); } // jeton expiré : on se reconnecte une fois
+if (type === 'bilan-ar' && r.status === 400) {
+for (const k of ['sectionId', 'section', 'position']) { delete champs.accessType; delete champs.sectionId; delete champs.section; delete champs.position; champs[k] = 1;
+r = await envoi(_idd.token); if (r.status !== 400) break; }
+}
 const j = await r.json().catch(() => null);
 return { ok: r.status === 201 || (r.ok && j && j.result === true), statut: r.status, code: cible, idIddigital: id, reponse: j && j.result !== undefined ? j.result : (j && (j.message || j.error)) || null };
 }
