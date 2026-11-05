@@ -904,6 +904,27 @@ if (r.ok && jeton) { _idd = { base, variante: nom, token: jeton, at: Date.now() 
 }
 const err = new Error('Connexion IDdigital impossible'); err.essais = essais; throw err;
 }
+// Envoi d'un PDF vers l'écran d'un magasin (code Suivi Stats) dans une catégorie IDdigital
+const IDD_TYPES = ['stats-tracking', 'month-stats'];
+async function iddEnvoyer(env, type, code, pdfB64, nomFichier) {
+if (!IDD_TYPES.includes(type)) throw new Error('Catégorie non prise en charge : ' + type);
+const c = await iddConnexion(env);
+if (!_idd.mags || Date.now() - (_idd.magsAt || 0) > 30 * 60000) { const m = await iddMagasins(env); _idd.mags = m.magasins; _idd.magsAt = Date.now(); }
+const cible = String(code).replace(/^0+(?=\d)/, '');
+const s = (_idd.mags || []).find(x => String(x.code ?? x.storeCode ?? x.codeSite ?? '').replace(/^0+(?=\d)/, '') === cible);
+if (!s) return { ok: false, code: cible, erreur: 'magasin sans écran IDdigital' };
+const id = s.id ?? s.storeId;
+const octets = Uint8Array.from(atob(String(pdfB64 || '')), x => x.charCodeAt(0));
+if (!octets.length) throw new Error('PDF vide');
+if (octets.length > 25 * 1024 * 1024) throw new Error('PDF de plus de 25 Mo');
+const envoi = async jeton => { const f = new FormData(); f.append('form', JSON.stringify({ storeIds: [id] }));
+f.append('file', new Blob([octets], { type: 'application/pdf' }), nomFichier || (type + '-' + cible + '.pdf'));
+return fetch(`${c.base}/${encodeURIComponent(jeton)}/v1.0/${type}`, { method: 'POST', headers: { Accept: 'application/json' }, body: f }); };
+let r = await envoi(c.token);
+if (r.status === 401) { const c2 = await iddConnexion(env, true); r = await envoi(c2.token); } // jeton expiré : on se reconnecte une fois
+const j = await r.json().catch(() => null);
+return { ok: r.status === 201 || (r.ok && j && j.result === true), statut: r.status, code: cible, idIddigital: id, reponse: j && j.result !== undefined ? j.result : (j && (j.message || j.error)) || null };
+}
 async function iddMagasins(env) {
 const c = await iddConnexion(env);
 const r = await fetch(`${c.base}/${encodeURIComponent(c.token)}/v1.0/getStore`, { headers: { Accept: 'application/json' } });
@@ -9199,6 +9220,10 @@ const o = out[String(r.code)] = out[String(r.code)] || { femmes: 0, hommes: 0, a
 if (/^(f|femme|feminin|mme|madame)/.test(g)) o.femmes += r.n || 0; else if (/^(h|m|homme|masculin|monsieur)/.test(g)) o.hommes += r.n || 0; else o.autres += r.n || 0;
 }
 return { mois: moisRh, magasins: out };
+}
+async iddigitalEnvoyer(type, code, pdfB64, nomFichier) {
+try { return await iddEnvoyer(this.env, type, code, pdfB64, nomFichier); }
+catch (e) { return { ok: false, code, erreur: String(e && e.message || e) }; }
 }
 async iddigitalTest() {
 // Test de connexion IDdigital : connexion + liste des magasins accessibles ; rien n'est envoyé aux écrans
