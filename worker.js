@@ -926,8 +926,10 @@ const octets = Uint8Array.from(atob(String(pdfB64 || '')), x => x.charCodeAt(0))
 if (!octets.length) throw new Error('PDF vide');
 if (octets.length > 25 * 1024 * 1024) throw new Error('PDF de plus de 25 Mo');
 const champs = { storeIds: [id] };
-if (type === 'bilan-ar') { const sec = await iddSectionAnimateur(c); if (sec == null) return { ok: false, code: cible, erreur: 'section « Animateur Réseau » introuvable dans IDdigital' }; champs.sectionId = sec; champs.section = sec; }
-if (type === 'task-sheet') champs.accessType = 1; // fiche de tâches : fichier 1
+// Bilan AR : champ fileSectionId = id (et non l'ordre d'affichage) de la section « Animateur Réseau », lu dans
+// GET bilan-ar/sections ; 1 par défaut (constaté le 05/11). Fiche de tâches : accessType = 1 (fichier 1).
+if (type === 'bilan-ar') { let sec = null; try { sec = await iddSectionAnimateur(c); } catch (e) {} champs.fileSectionId = sec != null ? +sec : 1; }
+if (type === 'task-sheet') champs.accessType = 1;
 const envoi = async jeton => { const f = new FormData(); f.append('form', JSON.stringify(champs));
 f.append('file', new Blob([octets], { type: 'application/pdf' }), nomFichier || (type + '-' + cible + '.pdf'));
 return fetch(`${c.base}/${encodeURIComponent(jeton)}/v1.0/${type}`, { method: 'POST', headers: { Accept: 'application/json' }, body: f }); };
