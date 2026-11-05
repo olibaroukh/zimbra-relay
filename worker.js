@@ -868,6 +868,25 @@ return !u.includes('@') || u === OLIVIER_EMAIL;
 // reconnexion suffit) — ils ont pu être délivrés à tort.
 const SESSION_TOKEN_VERSION = 2;
 
+// ---------- Rappel mensuel aux AR : critères manuels Managers Leaders / Magasins d'Excellence (05/11/2026) ----------
+// Le 1er de chaque mois, chaque animateur reçoit la liste de ses succursales et le lien vers l'écran de saisie de Suivi Stats.
+async function envoyerRappelMlme(env) {
+_suiviBinding = env.SUIVI || null; _suiviEnvDB = env.DB || null;
+const stores = (await getMagasinsServerSide()).filter(s => s.statut !== 'franchise' && s.animateurEmail);
+const parAr = {};
+stores.forEach(s => { (parAr[s.animateurEmail.toLowerCase()] = parAr[s.animateurEmail.toLowerCase()] || { nom: s.animateur, mags: [] }).mags.push(s); });
+const lien = 'https://olibaroukh.github.io/suivi-stats/#mlme';
+const mois = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'][new Date().getMonth()];
+let n = 0;
+for (const [email, a] of Object.entries(parAr)) {
+const liste = a.mags.map(s => `<li>${s.libelle} (${s.code})</li>`).join('');
+await zimbraSendMail(env, { to: email, subject: `Managers Leaders et Magasins d’Excellence – saisie de ${mois}`,
+bodyHtml: `<p>Bonjour ${a.nom || ''},</p><p>Merci de mettre à jour, pour chacune de tes succursales, les critères à saisir des <b>Managers Leaders et Magasins d’Excellence</b> (formation, retour terrain, planning, retours, dress code, vocabulaire, savoir-être) :</p><ul>${liste}</ul><p><a href="${lien}">Ouvrir l’écran de saisie dans Suivi Stats</a> (connexion avec ton compte Zimbra).</p><p>Les autres critères se calculent automatiquement.</p><p>Olivier</p>` });
+n++;
+}
+console.log('Rappel MLME envoyé à', n, 'animateur(s)');
+}
+
 // ---------- Accès magasin par code PIN (05/11/2026) ----------
 // Un code à 6 chiffres par magasin, envoyé par mail sur la boîte du magasin, saisi une fois par poste dans les applis
 // utilisées en magasin (PEDLV, Suivi magasin, Kaizen). Le code n'est jamais stocké en clair (empreinte SHA-256 salée).
@@ -9084,6 +9103,7 @@ ctx.waitUntil(clotureKaizen);
 // 03/10 : score de santé mensuel provisoire du mois écoulé, après la clôture Kaizen.
 ctx.waitUntil(clotureKaizen.then(() => withCronAlert(env, 'Score de santé mensuel (provisoire)', () => calculerSanteMensuelProvisoireCron(env))));
 ctx.waitUntil(withCronAlert(env, 'Rappel import RH', () => sendRhImportReminder(env)));
+ctx.waitUntil(withCronAlert(env, 'Rappel Managers Leaders / Magasins d’Excellence', () => envoyerRappelMlme(env)));
 } else if (cron === '0 4 * * MON' || cron === '0 4 * * WED' || cron === '0 4 * * FRI') {
 ctx.waitUntil(withCronAlert(env, 'Refresh Google ratings', () => refreshGoogleRatings(env)));
 } else {
@@ -9113,6 +9133,13 @@ return r.json();
 googleRatings() { return this._appel('/google-ratings'); }
 santeMensuel(mois) { return this._appel('/sante-mensuel?mois=' + encodeURIComponent(String(mois || ''))); }
 bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeURIComponent(String(du || '')) + '&to=' + encodeURIComponent(String(au || ''))); }
+async kaizenCumul(mois) {
+// Somme des points des audits Kaizen de l'année, de janvier au mois indiqué (AAAA-MM), par magasin
+const m = String(mois || ''); if (!/^\d{4}-\d{2}$/.test(m)) return {};
+const { results } = await this.env.DB.prepare('SELECT magasin_code AS code, SUM(score) AS total FROM kaizen_audits WHERE mois >= ? AND mois <= ? GROUP BY magasin_code').bind(m.slice(0, 4) + '-01', m).all();
+const out = {}; (results || []).forEach(r => { if (r.code) out[String(r.code)] = Math.round((r.total || 0) * 10) / 10; });
+return out;
+}
 async listePins() {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
 await pinTable(this.env);
