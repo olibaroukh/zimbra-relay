@@ -1,0 +1,30 @@
+# Configuration de déploiement de zimbra-relay (Workers Builds : déploiement automatique à chaque fusion sur main).
+# Reproduit à l'identique les réglages du tableau de bord Cloudflare au 05/11/2026.
+# Aucun secret ici : les secrets et variables restent saisis dans Cloudflare (keep_vars = true les conserve).
+name = "zimbra-relay"
+main = "worker.js"
+compatibility_date = "2026-06-18"
+workers_dev = true
+preview_urls = false
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bilan-passage-db"
+database_id = "48e345f7-b53f-46ba-b2da-27067976f4c1"
+
+[[d1_databases]]
+binding = "ARCHIVES"
+database_name = "rapports-archives"
+database_id = "dd609057-c4f3-41d4-8ec9-c9bb14da8ede"
+
+[[r2_buckets]]
+binding = "KAIZEN_PHOTOS"
+bucket_name = "kaizen-photos"
+
+# Tâches planifiées : expressions exactes attendues par scheduled() dans worker.js
+[triggers]
+crons = ["0 8 1 * *", "0 6 * * SUN", "0 4 * * MON", "0 20 * * SUN", "0 14 * * SUN"]
+
+[observability]
+enabled = true
