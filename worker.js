@@ -875,6 +875,8 @@ const SESSION_TOKEN_VERSION = 2;
 const MAGASIN_SESSION_TTL_MS = 400 * 24 * 3600 * 1000;
 async function pinTable(env) {
 await env.DB.prepare('CREATE TABLE IF NOT EXISTS magasin_pins (code TEXT PRIMARY KEY, pin_hash TEXT, version INTEGER, cree_le TEXT, envoye_a TEXT, echecs INTEGER DEFAULT 0, bloque_jusqua TEXT)').run();
+// Suivi des postes enregistrés (05/11) : dernière connexion et nombre de connexions depuis le code en vigueur
+for (const col of ['derniere_connexion TEXT', 'nb_connexions INTEGER DEFAULT 0']) { try { await env.DB.prepare('ALTER TABLE magasin_pins ADD COLUMN ' + col).run(); } catch (e) {} }
 }
 async function empreintePin(code, pin) {
 const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode((AR_SESSION_SECRET || '') + '|' + code + '|' + pin));
@@ -917,7 +919,7 @@ envoye = s.email;
 } catch (e) { erreur = 'envoi du mail : ' + String(e && e.message || e); }
 }
 }
-await env.DB.prepare('INSERT INTO magasin_pins (code, pin_hash, version, cree_le, envoye_a, echecs, bloque_jusqua) VALUES (?, ?, ?, ?, ?, 0, NULL) ON CONFLICT(code) DO UPDATE SET pin_hash = excluded.pin_hash, version = excluded.version, cree_le = excluded.cree_le, envoye_a = excluded.envoye_a, echecs = 0, bloque_jusqua = NULL')
+await env.DB.prepare('INSERT INTO magasin_pins (code, pin_hash, version, cree_le, envoye_a, echecs, bloque_jusqua) VALUES (?, ?, ?, ?, ?, 0, NULL) ON CONFLICT(code) DO UPDATE SET pin_hash = excluded.pin_hash, version = excluded.version, cree_le = excluded.cree_le, envoye_a = excluded.envoye_a, echecs = 0, bloque_jusqua = NULL, derniere_connexion = NULL, nb_connexions = 0')
 .bind(s.code, await empreintePin(s.code, pin), version, maintenant, envoye).run();
 // Le code n'est renvoyé (une seule fois, à l'administrateur) que s'il n'a pas pu partir par mail
 out.push({ code: s.code, libelle: s.libelle, ok: true, envoye, erreur, pin: envoye ? null : pin });
@@ -4832,7 +4834,7 @@ await chargerObjectifsReseauPedlv();
 const corsHeaders = {
 'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session, X-Accueil-Session',
+'Access-Control-Allow-Headers': 'Content-Type, X-Zimbra-Auth-Token, X-Notify-Token, X-Store-Token, X-AR-Session, X-Accomp-Session, X-Accueil-Session, X-Magasin-Session',
 'Access-Control-Max-Age': '86400',
 };
 
@@ -4858,7 +4860,7 @@ const e = (r.echecs || 0) + 1;
 await env.DB.prepare('UPDATE magasin_pins SET echecs = ?, bloque_jusqua = ? WHERE code = ?').bind(e >= 5 ? 0 : e, e >= 5 ? new Date(Date.now() + 15 * 60000).toISOString() : null, code).run();
 return j({ ok: false, error: 'Code PIN incorrect' }, 401);
 }
-await env.DB.prepare('UPDATE magasin_pins SET echecs = 0, bloque_jusqua = NULL WHERE code = ?').bind(code).run();
+await env.DB.prepare('UPDATE magasin_pins SET echecs = 0, bloque_jusqua = NULL, derniere_connexion = ?, nb_connexions = COALESCE(nb_connexions, 0) + 1 WHERE code = ?').bind(new Date().toISOString(), code).run();
 const s = (await getMagasinsServerSide()).find(x => x.code === code);
 return j({ ok: true, token: await createMagasinSession(code, r.version), magasin: { code, libelle: s ? s.libelle : '' } });
 } catch (e) { return j({ ok: false, error: 'Erreur de connexion : ' + String(e) }, 500); }
@@ -9090,9 +9092,9 @@ bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeU
 async listePins() {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
 await pinTable(this.env);
-const { results } = await this.env.DB.prepare('SELECT code, version, cree_le, envoye_a FROM magasin_pins').all();
+const { results } = await this.env.DB.prepare('SELECT code, version, cree_le, envoye_a, derniere_connexion, nb_connexions FROM magasin_pins').all();
 const idx = {}; (results || []).forEach(r => idx[r.code] = r);
-return (await getMagasinsServerSide()).map(s => ({ code: s.code, libelle: s.libelle, email: s.email || '', animateur: s.animateur || '', pin: idx[s.code] ? { version: idx[s.code].version, creeLe: idx[s.code].cree_le, envoyeA: idx[s.code].envoye_a } : null }));
+return (await getMagasinsServerSide()).map(s => ({ code: s.code, libelle: s.libelle, email: s.email || '', animateur: s.animateur || '', pin: idx[s.code] ? { version: idx[s.code].version, creeLe: idx[s.code].cree_le, envoyeA: idx[s.code].envoye_a, derniereConnexion: idx[s.code].derniere_connexion || null, nbConnexions: idx[s.code].nb_connexions || 0 } : null }));
 }
 async genererPins(codes, envoyer) {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
