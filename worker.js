@@ -3776,6 +3776,10 @@ m: { su: { _content: subject }, e: [{ t: 't', a: to }], mp: { ct: 'text/html', c
 })
 });
 if (!sendResp.ok) throw new Error('Envoi email échoué (' + sendResp.status + ')');
+// Zimbra peut répondre 200 avec une erreur SOAP dans le corps : on la remonte au lieu de croire l'envoi réussi
+const sendData = await sendResp.json().catch(() => null);
+const faute = sendData && sendData.Body && sendData.Body.Fault;
+if (faute) throw new Error('Envoi email refusé par Zimbra : ' + ((faute.Reason && faute.Reason.Text) || (faute.Detail && JSON.stringify(faute.Detail)) || 'erreur SOAP'));
 }
 
 // Suivi Managers (17/09) — variante avec pièce jointe PDF, même compte
