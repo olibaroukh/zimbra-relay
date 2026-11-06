@@ -7113,6 +7113,29 @@ if (url.pathname === '/rh-import/mois-existants') {
   }
 }
 
+// 06/11/2026 : mois passés — agenda seul, pour l'ETP de Suivi Stats uniquement. N'écrit RIEN dans la base
+// (ni effectif ni absences : l'effectif d'un mois passé n'est plus exportable tel qu'il était).
+if (url.pathname === '/rh-import/etp') {
+  const storeToken = request.headers.get('X-Store-Token');
+  if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
+  const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+  if (sessionAr !== 'ALL') return jsonError('Réservé à Olivier', 403, corsHeaders);
+  try {
+    const body = await request.json();
+    const mois = (body.mois || '').trim();
+    const rows = Array.isArray(body.rows) ? body.rows : [];
+    if (!/^\d{4}-\d{2}$/.test(mois)) return jsonError('Champ "mois" requis, format YYYY-MM', 400, corsHeaders);
+    if (!rows.length) return jsonError('Aucune ligne à importer', 400, corsHeaders);
+    if (!_suiviBinding || typeof _suiviBinding.deposerEtp !== 'function') return jsonError('Lien Suivi Stats indisponible', 500, corsHeaders);
+    const suiviStats = await _suiviBinding.deposerEtp(mois, rhCoefficientsEtp(rows, rhJoursDansMois(mois)));
+    return new Response(JSON.stringify({ ok: true, mois, nbSalaries: rows.length, suiviStats }), {
+      status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    });
+  } catch (e) {
+    return jsonError('Erreur ETP : ' + String(e && e.message || e), 500, corsHeaders);
+  }
+}
+
 if (url.pathname === '/rh-import/agenda') {
   const storeToken = request.headers.get('X-Store-Token');
   if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
