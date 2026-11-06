@@ -98,6 +98,43 @@ function rhCoefficientsEtp(rows, joursCalendaires) {
   return coefs;
 }
 
+// 06/11/2026 : l'effectif disponible du score santé suit la même règle que Suivi Stats — chaque salarié
+// compte poids (1/n sites) × moyenne de ses coefficients ETP depuis janvier (sans agenda = 1).
+// Coefficients conservés dans rh_etp_mensuel (mois, matricule sans zéros de tête, coef), écrits à chaque
+// import d'agenda (complet ou « agenda seul »), repris une fois depuis Suivi Stats si la table est vide.
+const RH_COEF_ETP_SQL = `COALESCE((SELECT AVG(e.coef) FROM rh_etp_mensuel e WHERE e.matricule = ltrim(es.matricule, '0')
+  AND e.mois >= substr(es.mois, 1, 4) || '-01' AND e.mois <= es.mois), 1)`;
+let _rhEtpPret = false;
+async function ensureRhEtp(env) {
+  if (_rhEtpPret || !env.DB) return;
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS rh_etp_mensuel (mois TEXT NOT NULL, matricule TEXT NOT NULL, coef REAL NOT NULL, PRIMARY KEY (matricule, mois))`).run();
+  const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM rh_etp_mensuel`).first();
+  if (!(n && n.n) && _suiviBinding && typeof _suiviBinding.lireEtp === 'function') {
+    try {
+      const fin = parisTodayIso().slice(0, 7);
+      for (let m = (Number(fin.slice(0, 4)) - 1) + '-01'; m <= fin; m = rhMoisSuivant(m)) {
+        const coefs = await _suiviBinding.lireEtp(m);
+        if (coefs && Object.keys(coefs).length) await rhEcrireEtp(env, m, coefs, true);
+      }
+    } catch (e) { console.error('Reprise ETP depuis Suivi Stats :', e); }
+  } else if (!(n && n.n)) return; // lien Suivi Stats absent : on retentera la reprise au prochain appel
+  _rhEtpPret = true;
+}
+function rhMoisSuivant(mois) {
+  const [y, m] = mois.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m, 1));
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
+}
+async function rhEcrireEtp(env, mois, coefs, sansEnsure) {
+  if (!sansEnsure) await ensureRhEtp(env);
+  const stmts = [env.DB.prepare(`DELETE FROM rh_etp_mensuel WHERE mois = ?`).bind(mois)];
+  for (const [m, v] of Object.entries(coefs)) {
+    const k = String(m).trim().replace(/\.0+$/, '').replace(/^0+(?=\d)/, '');
+    if (k && Number.isFinite(Number(v))) stmts.push(env.DB.prepare(`INSERT OR REPLACE INTO rh_etp_mensuel (mois, matricule, coef) VALUES (?, ?, ?)`).bind(mois, k, Number(v)));
+  }
+  for (let i = 0; i < stmts.length; i += 400) await env.DB.batch(stmts.slice(i, i + 400));
+}
+
 function rhJoursDansMois(mois) {
   const [y, m] = mois.split('-').map(Number);
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
@@ -177,12 +214,13 @@ async function getRhHealthSignalsMap(env) {
 
   let results;
   try {
-    results = await lectureRhEnCache(env, 'signaux', `
+    await ensureRhEtp(env);
+    results = await lectureRhEnCache(env, 'signaux-etp', `
       SELECT
         es.mois as mois,
         es.code_site as code_site,
-        SUM(es.poids) as effectif_total,
-        SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) as effectif_longue_duree,
+        SUM(es.poids * ${RH_COEF_ETP_SQL}) as effectif_total,
+        SUM(CASE WHEN a.longue_duree = 1 THEN es.poids * ${RH_COEF_ETP_SQL} ELSE 0 END) as effectif_longue_duree,
         SUM(a.jours_groupe_a * es.poids) as groupe_a_pondere,
         SUM(a.jours_ouvres_theoriques * es.poids) as theo_pondere
       FROM rh_effectif_site_mensuel es
@@ -1422,7 +1460,7 @@ const MEMO_ACTIVITE_MS = 60 * 1000;
 // évaluation équipe, observations) apparaissent au plus tard CACHE_CALC_MS
 // après : les invalider relançait le calcul réseau des dizaines de fois par heure.
 const CACHE_CALC_MS = 15 * 60 * 1000;
-const ROUTES_INVALIDANT_CALCULS = new Set(['/store-bilan', '/rh-import/effectif', '/rh-import/agenda', '/sante-mensuel', '/kaizen-import-historique', '/kaizen-import-historique-rollback', '/fermetures-reseau']);
+const ROUTES_INVALIDANT_CALCULS = new Set(['/store-bilan', '/rh-import/effectif', '/rh-import/agenda', '/rh-import/etp', '/sante-mensuel', '/kaizen-import-historique', '/kaizen-import-historique-rollback', '/fermetures-reseau']);
 let _cacheCalculsOk = false;
 async function ensureCacheCalculs(env) {
 if (_cacheCalculsOk || !env.DB) return;
@@ -2787,14 +2825,15 @@ const moisM1 = santeMoisDecale(mois, -1);
 const moisM2 = santeMoisDecale(mois, -2);
 const q = async (sql, ...b) => { const { results } = await env.DB.prepare(sql).bind(...b).all(); return results || []; };
 const qRh = (nom, sql, ...b) => lectureRhEnCache(env, nom, sql, b);
+await ensureRhEtp(env);
 
 const [bilans, notes, rhRows, rhElig, entretiens, lancements, kaizens, ratings, fermetures] = await Promise.all([
 q(`SELECT id, magasin_code, date, ca_annuel, data_json FROM (
 SELECT id, magasin_code, date, ca_annuel, data_json, ROW_NUMBER() OVER (PARTITION BY magasin_code ORDER BY date DESC, id DESC) AS rn
 FROM bilans WHERE date >= ? AND date <= ?) WHERE rn = 1`, debut, fin),
 q(`SELECT magasin_code, tache, note FROM notes_equipe WHERE annee = ? AND date_controle <= ?`, Number(mois.slice(0, 4)), fin),
-qRh('mensuel-absences', `SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids) AS eff_total,
-SUM(CASE WHEN a.longue_duree = 1 THEN es.poids ELSE 0 END) AS eff_ld,
+qRh('mensuel-absences-etp', `SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids * ${RH_COEF_ETP_SQL}) AS eff_total,
+SUM(CASE WHEN a.longue_duree = 1 THEN es.poids * ${RH_COEF_ETP_SQL} ELSE 0 END) AS eff_ld,
 SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
 FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
 WHERE es.site_reconnu = 1 AND es.mois >= ? AND es.mois <= ? GROUP BY es.mois, es.code_site`, santeMoisDecale(mois, -6), mois),
@@ -7113,8 +7152,8 @@ if (url.pathname === '/rh-import/mois-existants') {
   }
 }
 
-// 06/11/2026 : mois passés — agenda seul, pour l'ETP de Suivi Stats uniquement. N'écrit RIEN dans la base
-// (ni effectif ni absences : l'effectif d'un mois passé n'est plus exportable tel qu'il était).
+// 06/11/2026 : mois passés — agenda seul, pour l'ETP uniquement (Suivi Stats + table rh_etp_mensuel du score
+// santé). N'écrit ni effectif ni absences : l'effectif d'un mois passé n'est plus exportable tel qu'il était.
 if (url.pathname === '/rh-import/etp') {
   const storeToken = request.headers.get('X-Store-Token');
   if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
@@ -7127,7 +7166,9 @@ if (url.pathname === '/rh-import/etp') {
     if (!/^\d{4}-\d{2}$/.test(mois)) return jsonError('Champ "mois" requis, format YYYY-MM', 400, corsHeaders);
     if (!rows.length) return jsonError('Aucune ligne à importer', 400, corsHeaders);
     if (!_suiviBinding || typeof _suiviBinding.deposerEtp !== 'function') return jsonError('Lien Suivi Stats indisponible', 500, corsHeaders);
-    const suiviStats = await _suiviBinding.deposerEtp(mois, rhCoefficientsEtp(rows, rhJoursDansMois(mois)));
+    const coefsEtp = rhCoefficientsEtp(rows, rhJoursDansMois(mois));
+    const suiviStats = await _suiviBinding.deposerEtp(mois, coefsEtp);
+    await rhEcrireEtp(env, mois, coefsEtp); // pour le score santé (seul ajout dans la base : les coefficients)
     return new Response(JSON.stringify({ ok: true, mois, nbSalaries: rows.length, suiviStats }), {
       status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
     });
@@ -7243,6 +7284,7 @@ if (url.pathname === '/rh-import/agenda') {
         suiviStats = await _suiviBinding.deposerEtp(mois, rhCoefficientsEtp(rows, joursCalendaires));
       } catch (e) { suiviStats = { ok: false, erreur: String(e && e.message || e) }; }
     }
+    try { await rhEcrireEtp(env, mois, rhCoefficientsEtp(rows, joursCalendaires)); } catch (e) { console.error('ETP score santé :', e); }
 
     return new Response(JSON.stringify({ ok: true, mois, nbSalaries, nbLongueDuree, nbHorsReseau, nbImportes, suiviStats }), {
       status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -7285,12 +7327,13 @@ if (url.pathname === '/rh-effectif') {
       return new Response(JSON.stringify({ ok: true, mois: null, magasins: {} }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
     }
 
-    let query = `SELECT code_site, poste_categorie, SUM(poids) as total
-                 FROM rh_effectif_site_mensuel
-                 WHERE mois = ? AND site_reconnu = 1 AND poste_categorie IS NOT NULL`;
+    await ensureRhEtp(env);
+    let query = `SELECT es.code_site AS code_site, es.poste_categorie AS poste_categorie, SUM(es.poids * ${RH_COEF_ETP_SQL}) as total
+                 FROM rh_effectif_site_mensuel es
+                 WHERE es.mois = ? AND es.site_reconnu = 1 AND es.poste_categorie IS NOT NULL`;
     const binds = [dernierMois];
-    if (magasinCode) { query += ' AND code_site = ?'; binds.push(magasinCode); }
-    query += ' GROUP BY code_site, poste_categorie';
+    if (magasinCode) { query += ' AND es.code_site = ?'; binds.push(magasinCode); }
+    query += ' GROUP BY es.code_site, es.poste_categorie';
 
     const { results } = await env.DB.prepare(query).bind(...binds).all();
     const magasins = {};
