@@ -80,6 +80,24 @@ function rhNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// 06/11/2026 : coefficients ETP par matricule (voir /rh-import/agenda). Colonnes repérées sans
+// tenir compte des accents / majuscules ; une colonne absente compte 0.
+const RH_ETP_COLS = ['Journée école', 'Repos temps partiel', 'Temps partiel Thérapeutique'];
+function rhCoefficientsEtp(rows, joursCalendaires) {
+  const cle = k => String(k).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  const ref = joursCalendaires * 5 / 7;
+  const coefs = {};
+  let colonnes = null;
+  for (const row of rows) {
+    const matricule = String(row['Matricule'] ?? '').trim().replace(/\.0+$/, '');
+    if (!matricule) continue;
+    if (!colonnes) colonnes = RH_ETP_COLS.map(c => Object.keys(row).find(k => cle(k) === cle(c)));
+    const jours = colonnes.reduce((a, k) => a + (k ? rhNum(row[k]) : 0), 0);
+    coefs[matricule] = Math.max(0, Math.min(1, Math.round((1 - jours / ref) * 1000) / 1000));
+  }
+  return coefs;
+}
+
 function rhJoursDansMois(mois) {
   const [y, m] = mois.split('-').map(Number);
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
@@ -7191,7 +7209,19 @@ if (url.pathname === '/rh-import/agenda') {
       await env.DB.batch(stmts.slice(i, i + 400));
     }
 
-    return new Response(JSON.stringify({ ok: true, mois, nbSalaries, nbLongueDuree, nbHorsReseau, nbImportes }), {
+    // 06/11/2026 : effectif réel en équivalent temps plein pour Suivi Stats (règle validée par Olivier).
+    // Coefficient par salarié = 1 − (journées école + repos temps partiel + temps partiel thérapeutique)
+    // ÷ (jours du mois × 5/7), borné à [0 ; 1]. Seul le coefficient est transmis (jamais le motif),
+    // pour tous les salariés du fichier ; Suivi Stats fait la moyenne des mois depuis janvier.
+    // Jamais bloquant pour l'import de bilan-passage.
+    let suiviStats = null;
+    if (_suiviBinding && typeof _suiviBinding.deposerEtp === 'function') {
+      try {
+        suiviStats = await _suiviBinding.deposerEtp(mois, rhCoefficientsEtp(rows, joursCalendaires));
+      } catch (e) { suiviStats = { ok: false, erreur: String(e && e.message || e) }; }
+    }
+
+    return new Response(JSON.stringify({ ok: true, mois, nbSalaries, nbLongueDuree, nbHorsReseau, nbImportes, suiviStats }), {
       status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders },
     });
   } catch (e) {
