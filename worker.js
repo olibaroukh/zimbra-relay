@@ -5086,7 +5086,7 @@ const lignes = ['code;libelle;email;manager;eff_opt;eff_audio;eff_theo;animateur
 return new Response(lignes.join('\n') + '\n', { headers: { ...corsHeaders, 'Content-Type': 'text/csv; charset=utf-8', 'Cache-Control': 'no-store', 'X-Source-Referentiel': rows.length && rows[0].source === 'suivi-stats' ? 'suivi-stats' : 'magasins.csv' } });
 }
 
-if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau' || url.pathname === '/brouillons' || url.pathname === '/brouillon-get' || url.pathname === '/reunion-sujets' || url.pathname === '/reunion-sujets-admin' || url.pathname === '/reunion-get'))) {
+if (request.method !== 'POST' && !(request.method === 'GET' && (url.pathname === '/bilans' || url.pathname === '/bilan-get' || url.pathname === '/pedlv-archives' || url.pathname === '/pedlv-archive-get' || url.pathname === '/accueil-apps' || url.pathname === '/accueil-admin' || url.pathname === '/test-weekly-report' || url.pathname === '/com-hebdo' || url.pathname === '/test-com-hebdo' || url.pathname === '/test-monthly-report' || url.pathname === '/test-kaizen-cloture' || url.pathname === '/google-ratings' || url.pathname === '/health-weights' || url.pathname === '/test-google-ratings-refresh' || url.pathname === '/test-visit-reminders' || url.pathname === '/store-health' || url.pathname === '/activite-jour' || url.pathname === '/sante-mensuel' || url.pathname === '/store-health-detail' || url.pathname === '/score-magasin' || url.pathname === '/bilan-prefill' || url.pathname === '/ar-dashboard' || url.pathname === '/last-actions' || url.pathname === '/evaluation/magasin' || url.pathname === '/evaluation/reseau' || url.pathname === '/evaluation/export-reseau' || url.pathname === '/kaizen-etat' || url.pathname === '/kaizen-historique' || url.pathname === '/kaizen-photo' || url.pathname === '/debug-magasins-non-reconnus' || url.pathname === '/rh-effectif' || url.pathname === '/rh-taux-collab' || url.pathname === '/accompagnement-list' || url.pathname === '/accompagnement-get' || url.pathname === '/accompagnement-magasin-data' || url.pathname === '/accompagnement-swot-items' || url.pathname === '/cron/accompagnement-relances' || url.pathname === '/historique-managers' || url.pathname === '/suivis-magasin' || url.pathname === '/suivis-collaborateur' || url.pathname === '/collab-stats' || url.pathname === '/rh-collaborateurs' || url.pathname === '/store-monthly-stats' || url.pathname === '/nutrition-log/ping' || url.pathname === '/nutrition-log/summary' || url.pathname === '/ar-checklist' || url.pathname === '/fermetures-reseau' || url.pathname === '/brouillons' || url.pathname === '/brouillon-get' || url.pathname === '/reunion-sujets' || url.pathname === '/reunion-sujets-admin' || url.pathname === '/reunion-get'))) {
 return new Response('Méthode non autorisée', { status: 405, headers: corsHeaders });
 }
 
@@ -7296,6 +7296,39 @@ if (url.pathname === '/rh-import/agenda') {
 
 // Route de lecture — effectif réel par magasin (dernier mois chargé), pour
 // pré-remplir Bilan de Passage et Pour être dans le vert (phase 3, 20/08).
+// 06/11/2026 : Pour être dans le vert — temps de travail des collaborateurs pré-rempli avec le coefficient ETP
+// du dernier agenda validés importé. Poste enregistré obligatoire (PIN magasin, animateur ou AR) ; seuls les
+// salariés rattachés aux magasins du demandeur sont renvoyés ; coefficient seul, jamais le motif.
+if (url.pathname === '/rh-taux-collab') {
+  const j = (o, st = 200) => new Response(JSON.stringify(o), { status: st, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+  if (request.headers.get('X-Store-Token') !== STORE_SECRET) return j({ ok: false, error: 'Non autorisé' }, 401);
+  try {
+    const mag = await verifyMagasinSession(env, request.headers.get('X-Magasin-Session'));
+    const ar = mag ? null : ((await verifyAnimateurSession(request.headers.get('X-Animateur-Session'))) || (await verifyArSession(request.headers.get('X-AR-Session'))));
+    if (!mag && !ar) return j({ ok: false, error: 'Poste non enregistré' }, 401);
+    const mats = [...new Set(String(url.searchParams.get('matricules') || '').split(',').map(m => m.trim().replace(/\.0+$/, '').replace(/^0+(?=\d)/, '')).filter(Boolean))].slice(0, 200);
+    if (!mats.length) return j({ ok: true, mois: null, taux: {} });
+    await ensureRhEtp(env);
+    const dern = await env.DB.prepare('SELECT MAX(mois) AS mois FROM rh_etp_mensuel').first();
+    const mois = dern && dern.mois;
+    if (!mois) return j({ ok: true, mois: null, taux: {} });
+    // Magasins autorisés
+    let codes = null; // null = tous (Olivier)
+    if (mag) codes = new Set([String(mag)]);
+    else if (ar !== 'ALL') codes = new Set((await getMagasinsServerSide()).filter(x => x.animateur === ar).map(x => String(x.code)));
+    const derEff = await env.DB.prepare('SELECT MAX(mois) AS mois FROM rh_effectif_site_mensuel').first();
+    const ph = mats.map(() => '?').join(',');
+    const { results } = await env.DB.prepare(
+      `SELECT ltrim(es.matricule, '0') AS m, es.code_site AS code, e.coef AS coef
+       FROM rh_effectif_site_mensuel es JOIN rh_etp_mensuel e ON e.matricule = ltrim(es.matricule, '0') AND e.mois = ?
+       WHERE es.mois = ? AND ltrim(es.matricule, '0') IN (${ph})`
+    ).bind(mois, derEff && derEff.mois, ...mats).all();
+    const taux = {};
+    for (const r of results || []) if (!codes || codes.has(String(r.code))) taux[r.m] = r.coef;
+    return j({ ok: true, mois, taux });
+  } catch (e) { return j({ ok: false, error: String(e && e.message || e) }, 500); }
+}
+
 if (url.pathname === '/rh-effectif') {
   const storeToken = request.headers.get('X-Store-Token');
   if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
