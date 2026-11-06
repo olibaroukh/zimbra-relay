@@ -2884,6 +2884,21 @@ const joursOuvertsStd = joursAttendusLancement(mois, false, fermSet);
 const joursOuvertsAM = joursAttendusLancement(mois, true, fermSet);
 const finMs = Date.parse(fin + 'T23:59:59Z');
 
+// 06/11/2026 (règle d'Olivier) : sans bilan de passage dans le mois, Actions et Positionnement reprennent
+// les sous-scores du dernier mois VALIDÉ où ils ont été mesurés (un bilan existait), au lieu d'être neutralisés.
+const repriseBilan = {};
+try {
+  const anc = await q(`SELECT s.mois AS mois, s.magasin_code AS code, s.sous_scores_json AS sous, s.entrees_json AS entrees
+    FROM sante_mensuel s JOIN sante_mensuel_mois m ON m.mois = s.mois AND m.version = s.version
+    WHERE m.statut = 'valide' AND s.mois < ? ORDER BY s.mois DESC`, mois);
+  for (const r of anc) {
+    if (repriseBilan[r.code]) continue;
+    let e = {}, so = {}; try { e = JSON.parse(r.entrees || '{}'); so = JSON.parse(r.sous || '{}'); } catch (x) { continue; }
+    if (!e.bilan || so.actions == null || so.positionnement == null) continue;
+    repriseBilan[r.code] = { mois: r.mois, actions: so.actions, positionnement: so.positionnement, bilan: e.bilan };
+  }
+} catch (e) { console.error('Reprise bilan (score santé) :', e); }
+
 return stores.map(store => {
 const code = store.code;
 const fige = (figes && figes[code]) || null;
@@ -2900,6 +2915,11 @@ sous.actions = Math.max(0, 100 - penalite);
 const pos = toNumOrNull(b.ca_annuel);
 sous.positionnement = pos === null ? 0 : Math.max(0, Math.min(100, pos));
 entrees.bilan = { id: b.id, date: b.date, actionsReportees: reportees.length, actionsAFaire: reportees.filter(a => a._status === 'todo').length, positionnementAnnuel: pos };
+} else if (repriseBilan[code]) {
+const rp = repriseBilan[code];
+sous.actions = rp.actions; sous.positionnement = rp.positionnement;
+entrees.bilan = null;
+entrees.bilanRepris = { mois: rp.mois, id: rp.bilan.id, date: rp.bilan.date };
 } else {
 sous.actions = 0; sous.positionnement = 0;
 entrees.bilan = null;
