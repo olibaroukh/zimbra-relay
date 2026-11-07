@@ -5039,14 +5039,21 @@ const url = new URL(request.url);
 
 // 07/11/2026 : observation avant fermeture de la clé partagée (partie D) — chaque appel qui n'utilise QUE la clé
 // partagée (aucune session magasin / animateur / AR / accompagnement / accueil) est compté par jour, appli et route.
+// 07/11/2026 : partie D — fermeture de la clé partagée par la variable Cloudflare CLE_PARTAGEE_FERMEE = oui
+// (Workers & Pages › zimbra-relay › Settings › Variables). Réversible immédiatement : effacer la variable ou mettre « non ».
+// Seules restent ouvertes les routes de connexion (qui délivrent justement une session).
+const ROUTES_SANS_SESSION = new Set(['/magasin-login', '/ar-login', '/accompagnement-login', '/accueil-login', '/poste-animateur', '/nutrition-log/ping', '/cle-usage']);
+const cleFermee = /^(oui|1|true)$/i.test(String(env.CLE_PARTAGEE_FERMEE || ''));
 if (request.headers.get('X-Store-Token') === STORE_SECRET && env.DB && url.hostname !== 'relais.interne'
-  && !['X-Magasin-Session', 'X-Animateur-Session', 'X-AR-Session', 'X-Accomp-Session', 'X-Accueil-Session'].some(k => request.headers.get(k))) {
+  && !['X-Magasin-Session', 'X-Animateur-Session', 'X-AR-Session', 'X-Accomp-Session', 'X-Accueil-Session', 'X-Zimbra-Auth-Token', 'X-Notify-Token'].some(k => request.headers.get(k))) {
+  const bloque = cleFermee && !ROUTES_SANS_SESSION.has(url.pathname);
   try {
     const ref = request.headers.get('Referer') || '', appli = (ref.match(/^https?:\/\/[^/]+\/([^/?#]+)/) || [])[1] || (ref ? new URL(ref).hostname : 'inconnue');
     await env.DB.prepare('CREATE TABLE IF NOT EXISTS cle_usage (jour TEXT, appli TEXT, chemin TEXT, nb INTEGER, PRIMARY KEY (jour, appli, chemin))').run();
     await env.DB.prepare('INSERT INTO cle_usage (jour, appli, chemin, nb) VALUES (?, ?, ?, 1) ON CONFLICT(jour, appli, chemin) DO UPDATE SET nb = nb + 1')
-      .bind(new Date().toISOString().slice(0, 10), appli.slice(0, 60), url.pathname.slice(0, 80)).run();
+      .bind(new Date().toISOString().slice(0, 10), (bloque ? '[bloqué] ' : '') + appli.slice(0, 60), url.pathname.slice(0, 80)).run();
   } catch (e) { /* l'observation ne doit jamais bloquer un appel */ }
+  if (bloque) return new Response(JSON.stringify({ ok: false, code: 'POSTE_REQUIS', error: 'Ce poste n’est pas enregistré : saisissez le code PIN du magasin (ou connectez-vous).' }), { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 }
 if (url.pathname === '/cle-usage' && request.method === 'GET') {
   if (request.headers.get('X-Store-Token') !== STORE_SECRET || (await verifyArSession(request.headers.get('X-AR-Session'))) !== 'ALL') return new Response(JSON.stringify({ ok: false, error: 'Réservé à Olivier' }), { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
