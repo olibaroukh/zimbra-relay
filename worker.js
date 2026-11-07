@@ -5037,6 +5037,24 @@ return new Response(null, { status: 204, headers: corsHeaders });
 
 const url = new URL(request.url);
 
+// 07/11/2026 : observation avant fermeture de la clé partagée (partie D) — chaque appel qui n'utilise QUE la clé
+// partagée (aucune session magasin / animateur / AR / accompagnement / accueil) est compté par jour, appli et route.
+if (request.headers.get('X-Store-Token') === STORE_SECRET && env.DB && url.hostname !== 'relais.interne'
+  && !['X-Magasin-Session', 'X-Animateur-Session', 'X-AR-Session', 'X-Accomp-Session', 'X-Accueil-Session'].some(k => request.headers.get(k))) {
+  try {
+    const ref = request.headers.get('Referer') || '', appli = (ref.match(/^https?:\/\/[^/]+\/([^/?#]+)/) || [])[1] || (ref ? new URL(ref).hostname : 'inconnue');
+    await env.DB.prepare('CREATE TABLE IF NOT EXISTS cle_usage (jour TEXT, appli TEXT, chemin TEXT, nb INTEGER, PRIMARY KEY (jour, appli, chemin))').run();
+    await env.DB.prepare('INSERT INTO cle_usage (jour, appli, chemin, nb) VALUES (?, ?, ?, 1) ON CONFLICT(jour, appli, chemin) DO UPDATE SET nb = nb + 1')
+      .bind(new Date().toISOString().slice(0, 10), appli.slice(0, 60), url.pathname.slice(0, 80)).run();
+  } catch (e) { /* l'observation ne doit jamais bloquer un appel */ }
+}
+if (url.pathname === '/cle-usage' && request.method === 'GET') {
+  if (request.headers.get('X-Store-Token') !== STORE_SECRET || (await verifyArSession(request.headers.get('X-AR-Session'))) !== 'ALL') return new Response(JSON.stringify({ ok: false, error: 'Réservé à Olivier' }), { status: 403, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+  let lignes = [];
+  try { const r = await env.DB.prepare("SELECT appli, chemin, SUM(nb) AS nb, MAX(jour) AS dernier FROM cle_usage WHERE jour >= date('now', '-14 day') GROUP BY appli, chemin ORDER BY nb DESC").all(); lignes = r.results || []; } catch (e) { /* table pas encore créée */ }
+  return new Response(JSON.stringify({ ok: true, lignes }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
 // Enregistrement d'un poste d'animateur réseau / Siège : session AR (connexion Zimbra) → session de poste 90 jours
 if (request.method === 'POST' && url.pathname === '/poste-animateur') {
 const ar = await verifyArSession(request.headers.get('X-AR-Session'));
@@ -9380,6 +9398,7 @@ const r = await GESTIONNAIRE_PRINCIPAL.fetch(req, this.env);
 return r.json();
 }
 googleRatings() { return this._appel('/google-ratings'); }
+cleUsage() { return this._appel('/cle-usage'); }
 santeMensuel(mois) { return this._appel('/sante-mensuel?mois=' + encodeURIComponent(String(mois || ''))); }
 bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeURIComponent(String(du || '')) + '&to=' + encodeURIComponent(String(au || ''))); }
 async kaizenCumul(mois) {
