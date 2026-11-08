@@ -3153,8 +3153,9 @@ await calculerSanteMensuel(env, mois, 'Calcul automatique (1er du mois)');
 //   mois exclu pour ce magasin.
 // - Poids : ceux du dernier mois validé de l'année. Seuil de 50 % inchangé.
 // ===========================================================================
-async function santeAnnuel(env, annee, stores) {
-const debut = annee + '-01', fin = annee + '-12';
+async function santeAnnuel(env, annee, stores, jusqua = null) {
+// jusqua (AAAA-MM, facultatif) : score annuel « à fin de ce mois » (Suivi Stats fige le score du mois traité).
+const debut = annee + '-01', fin = (jusqua && /^\d{4}-\d{2}$/.test(jusqua) && jusqua.slice(0, 4) === String(annee)) ? jusqua : annee + '-12';
 const { results: moisRows } = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE statut = 'valide' AND mois >= ? AND mois <= ? ORDER BY mois`).bind(debut, fin).all();
 const moisValides = moisRows || [];
 if (!moisValides.length) return { moisValides: [], poids: null, poidsMois: null, magasins: [] };
@@ -3230,9 +3231,10 @@ const anneeParam = url.searchParams.get('annee');
 if (anneeParam) {
 if (!/^\d{4}$/.test(anneeParam) || anneeParam > moisCourant.slice(0, 4)) return jsonError('Année invalide', 400, corsHeaders);
 const { results: tousMois } = await env.DB.prepare(`SELECT mois, statut, version FROM sante_mensuel_mois ORDER BY mois DESC`).all();
-const r = await santeAnnuel(env, Number(anneeParam), stores);
+const jusqua = url.searchParams.get('jusqua');
+const r = await santeAnnuel(env, Number(anneeParam), stores, jusqua);
 return json({
-ok: true, annuel: true, annee: Number(anneeParam), estOlivier, moisCourant, reglesVersion: SANTE_REGLES_VERSION,
+ok: true, annuel: true, annee: Number(anneeParam), jusqua: jusqua || null, estOlivier, moisCourant, reglesVersion: SANTE_REGLES_VERSION,
 dims: SANTE_DIMS, poids: r.poids, poidsMois: r.poidsMois, moisValides: r.moisValides, moisCalcules: tousMois || [],
 magasins: r.magasins.filter(m => codesScope.has(m.code)),
 });
@@ -9487,6 +9489,8 @@ return r.json();
 googleRatings() { return this._appel('/google-ratings'); }
 cleUsage() { return this._appel('/cle-usage'); }
 santeMensuel(mois) { return this._appel('/sante-mensuel?mois=' + encodeURIComponent(String(mois || ''))); }
+// 08/11/2026 : score santé annuel à fin d'un mois (Suivi Stats : fiche magasin, dossier de visite)
+santeAnnuel(mois) { const m = String(mois || ''); if (!/^\d{4}-\d{2}$/.test(m)) return { ok: false, error: 'Mois invalide' }; return this._appel('/sante-mensuel?annee=' + m.slice(0, 4) + '&jusqua=' + m); }
 bilans(du, au) { return this._appel('/bilans?light=1&limit=1000&from=' + encodeURIComponent(String(du || '')) + '&to=' + encodeURIComponent(String(au || ''))); }
 async kaizenCumul(mois) {
 // Somme des points des audits Kaizen de l'année, de janvier au mois indiqué (AAAA-MM), par magasin
