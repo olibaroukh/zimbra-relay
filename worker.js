@@ -3141,6 +3141,74 @@ if (etat) return;
 await calculerSanteMensuel(env, mois, 'Calcul automatique (1er du mois)');
 }
 
+// ===========================================================================
+// 08/11/2026 (règles d'Olivier) : SCORE SANTÉ ANNUEL, calculé à la volée (rien
+// n'est enregistré) à partir des mois VALIDÉS de l'année civile, dès janvier.
+// - Critères réévalués chaque mois : moyenne des sous-scores mensuels où la
+//   dimension a été comptée (un mois où elle est neutralisée ou exclue est
+//   retiré de la moyenne, pas compté 0).
+// - Équipe : niveau du dernier mois validé où elle est comptée (le mensuel
+//   cumule déjà tous les contrôles depuis le 1er janvier).
+// - Mois « pas de score » (couverture < 50 %) ou magasin neutralisé en entier :
+//   mois exclu pour ce magasin.
+// - Poids : ceux du dernier mois validé de l'année. Seuil de 50 % inchangé.
+// ===========================================================================
+async function santeAnnuel(env, annee, stores) {
+const debut = annee + '-01', fin = annee + '-12';
+const { results: moisRows } = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE statut = 'valide' AND mois >= ? AND mois <= ? ORDER BY mois`).bind(debut, fin).all();
+const moisValides = moisRows || [];
+if (!moisValides.length) return { moisValides: [], poids: null, poidsMois: null, magasins: [] };
+const dernier = moisValides[moisValides.length - 1];
+const poids = JSON.parse(dernier.poids_json || '{}');
+const { results: rows } = await env.DB.prepare(`SELECT s.* FROM sante_mensuel s JOIN sante_mensuel_mois m ON m.mois = s.mois AND m.version = s.version
+WHERE m.statut = 'valide' AND s.mois >= ? AND s.mois <= ? ORDER BY s.mois`).bind(debut, fin).all();
+const parCode = {};
+for (const r of (rows || [])) {
+let sous = {}, exclusions = {}, neutralisations = {};
+try { sous = JSON.parse(r.sous_scores_json || '{}'); exclusions = JSON.parse(r.exclusions_json || '{}'); neutralisations = JSON.parse(r.neutralisations_json || '{}'); } catch (e) { continue; }
+(parCode[r.magasin_code] ??= []).push({ mois: r.mois, score: r.score, couverture: r.couverture, libelle: r.magasin_libelle, animateur: r.animateur, sous, exclusions, neutralisations });
+}
+const storesMap = new Map(stores.map(s => [s.code, s]));
+const magasins = [];
+for (const [code, lignes] of Object.entries(parCode)) {
+const st = storesMap.get(code) || {};
+const derniereLigne = lignes[lignes.length - 1];
+const moisScores = lignes.map(l => ({ mois: l.mois, score: l.score ?? null, couverture: l.couverture ?? null, entier: !!l.neutralisations['*'] }));
+const retenus = lignes.filter(l => !l.neutralisations['*'] && l.score !== null && l.score !== undefined);
+const sous = {}, exclusions = {}, detail = {};
+for (const d of SANTE_DIMS) {
+const comptes = retenus.filter(l => !l.neutralisations[d] && !l.exclusions[d] && l.sous[d] !== null && l.sous[d] !== undefined);
+if (!comptes.length) {
+sous[d] = null;
+exclusions[d] = retenus.length ? 'Jamais comptée sur les mois retenus' : 'Aucun mois retenu';
+detail[d] = { mode: d === 'equipe' ? 'dernier' : 'moyenne', nbMois: 0, mois: [] };
+continue;
+}
+if (d === 'equipe') {
+const l = comptes[comptes.length - 1];
+sous[d] = Number(l.sous[d]);
+detail[d] = { mode: 'dernier', nbMois: comptes.length, mois: [l.mois] };
+} else {
+sous[d] = santeArrondi1(comptes.reduce((s, l) => s + Number(l.sous[d]), 0) / comptes.length);
+detail[d] = { mode: 'moyenne', nbMois: comptes.length, mois: comptes.map(l => l.mois) };
+}
+}
+const final = retenus.length ? santeScoreFinal(sous, exclusions, new Set(), poids) : { score: null, couverture: 0 };
+magasins.push({
+code, libelle: st.libelle || derniereLigne.libelle || code, animateur: st.animateur || derniereLigne.animateur || null,
+score: final.score, couverture: final.couverture, nbMoisRetenus: retenus.length, nbMoisPresents: lignes.length,
+sous, exclusions, detail, moisScores,
+});
+}
+// Rangs (réseau et par AR) sur tous les magasins notés.
+const notes = magasins.filter(m => m.score !== null).sort((a, b) => b.score - a.score);
+const rangR = {}, rangA = {}, parAr = {};
+notes.forEach((m, i) => { rangR[m.code] = i + 1; (parAr[m.animateur || ''] ??= []).push(m); });
+Object.values(parAr).forEach(arr => arr.forEach((m, i) => { rangA[m.code] = i + 1; }));
+magasins.forEach(m => { m.rangReseau = rangR[m.code] ?? null; m.rangAr = rangA[m.code] ?? null; });
+return { moisValides: moisValides.map(m => ({ mois: m.mois, version: m.version, valideLe: m.valide_le, reviseLe: m.revise_le })), poids, poidsMois: dernier.mois, magasins };
+}
+
 async function handleSanteMensuel(request, env, url, corsHeaders) {
 const storeToken = request.headers.get('X-Store-Token');
 if (storeToken !== STORE_SECRET) return jsonError('Non autorisé', 401, corsHeaders);
@@ -3157,6 +3225,18 @@ const moisCourant = parisTodayIso().slice(0, 7);
 const moisOk = m => /^\d{4}-(0[1-9]|1[0-2])$/.test(m || '') && m <= moisCourant;
 
 if (request.method === 'GET') {
+// 08/11/2026 : score annuel (?annee=AAAA), calculé à la volée sur les mois validés.
+const anneeParam = url.searchParams.get('annee');
+if (anneeParam) {
+if (!/^\d{4}$/.test(anneeParam) || anneeParam > moisCourant.slice(0, 4)) return jsonError('Année invalide', 400, corsHeaders);
+const { results: tousMois } = await env.DB.prepare(`SELECT mois, statut, version FROM sante_mensuel_mois ORDER BY mois DESC`).all();
+const r = await santeAnnuel(env, Number(anneeParam), stores);
+return json({
+ok: true, annuel: true, annee: Number(anneeParam), estOlivier, moisCourant, reglesVersion: SANTE_REGLES_VERSION,
+dims: SANTE_DIMS, poids: r.poids, poidsMois: r.poidsMois, moisValides: r.moisValides, moisCalcules: tousMois || [],
+magasins: r.magasins.filter(m => codesScope.has(m.code)),
+});
+}
 const mois = url.searchParams.get('mois') || santeMoisDecale(moisCourant, -1);
 if (!moisOk(mois)) return jsonError('Mois invalide', 400, corsHeaders);
 const { results: moisCalcules } = await env.DB.prepare(`SELECT mois, statut, version FROM sante_mensuel_mois ORDER BY mois DESC`).all();
