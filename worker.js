@@ -1767,7 +1767,7 @@ const rows = await activiteQuery(env, sqls, binds);
 return (rows && rows[0]) || null;
 }
 
-async function buildBilanPrefill(env, store) {
+async function buildBilanPrefill(env, store, source) {
 const code = store.code;
 const nb = v => (v === null || v === undefined || v === '' || !isFinite(Number(v))) ? null : Number(v);
 const r1 = v => v === null ? null : Math.round(v * 10) / 10;
@@ -1812,7 +1812,8 @@ let kpis = null, sourceKpis = null, suiviInfo = null;
 // Priorité (consigne d'Olivier, 05/11/2026) : 1) Suivi Stats (cumul à fin du dernier mois enregistré),
 // 2) Pour être dans le vert (extraction Cosium « à date »), 3) saisie manuelle de l'AR.
 try {
-if (_suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+// 10/11/2026 : source choisie par l'AR (?source=pedlv) → Suivi Stats ignoré, indicateurs absents de PEDLV laissés vides
+if (source !== 'pedlv' && _suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
 const sv = await _suiviBinding.statsMagasin(code);
 const N = sv && sv.magasin && sv.magasin.N;
 if (N && N.P != null) {
@@ -6361,7 +6362,7 @@ const store = stores.find(s => s.code === code);
 if (!store) return jsonError('Magasin inconnu', 404, corsHeaders);
 if (sessionAr !== 'ALL' && store.animateur !== sessionAr) return jsonError('Magasin hors de votre périmètre', 403, corsHeaders);
 try {
-const data = await buildBilanPrefill(env, store);
+const data = await buildBilanPrefill(env, store, url.searchParams.get('source') === 'pedlv' ? 'pedlv' : 'suivi');
 return new Response(JSON.stringify({ ok: true, ...data }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 } catch (e) {
 return jsonError('Erreur pré-remplissage bilan : ' + String(e), 500, corsHeaders);
@@ -8136,8 +8137,14 @@ const parCle = {};
 for (const row of results) parCle[matKey(row.matricule)] = row;
 const collaborateurs = {};
 for (const m of matricules) { const row = parCle[matKey(m)]; if (row) collaborateurs[m] = { ...row, matricule: m }; }
+// 10/11/2026 : choix de la source par l'utilisateur (?source=pedlv) — PEDLV seul : extraction « à date », valeurs modifiables,
+// indicateurs absents de PEDLV laissés vides (consigne d'Olivier). Par défaut : Suivi Stats prioritaire comme avant.
+const sourceDemandee = url.searchParams.get('source') === 'pedlv' ? 'pedlv' : 'suivi';
+if (sourceDemandee === 'pedlv') {
+for (const m of Object.keys(collaborateurs)) { const c = collaborateurs[m]; collaborateurs[m] = { ...c, source: 'pedlv', sourceLibelle: 'Pour être dans le vert – extraction' + (c.periode ? ' ' + c.periode : ''), champsVerrouilles: [] }; }
+}
 // 05/11/2026 : priorité aux stats Suivi Stats (cumul à fin du dernier mois enregistré), puis PEDLV, puis saisie
-if (_suiviBinding && typeof _suiviBinding.statsVendeurs === 'function') {
+if (sourceDemandee === 'suivi' && _suiviBinding && typeof _suiviBinding.statsVendeurs === 'function') {
 try {
 const sv = await _suiviBinding.statsVendeurs(matricules);
 const MOIS_FR = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
@@ -8230,8 +8237,11 @@ if (b) { positionnementAnnuel = toNumOrNull(b.ca_annuel); positionnementAnnuelDa
 } catch (e) {}
 // 05/11/2026 : positionnement annuel mesuré (Suivi Stats, cumul à fin du dernier mois) prioritaire sur la saisie du bilan
 let positionnementAnnuelSource = positionnementAnnuel != null ? 'bilan' : null;
+// 10/11/2026 : source PEDLV choisie → pas de positionnement annuel (absent de PEDLV, laissé à saisir)
+const sourcePedlvMag = url.searchParams.get('source') === 'pedlv';
+if (sourcePedlvMag) { positionnementAnnuel = null; positionnementAnnuelDate = null; positionnementAnnuelSource = null; }
 try {
-if (_suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
+if (!sourcePedlvMag && _suiviBinding && typeof _suiviBinding.statsMagasin === 'function') {
 const sv = await _suiviBinding.statsMagasin(magasinCode);
 const N = sv && sv.magasin && sv.magasin.N, m = sv && Number(String(sv.mois || '').slice(5));
 if (N && N.P != null && N.O && m) { positionnementAnnuel = Math.round(N.P * 12 / m / (N.O * 1000) * 1000) / 10; positionnementAnnuelDate = sv.mois; positionnementAnnuelSource = 'suivi-stats'; }
