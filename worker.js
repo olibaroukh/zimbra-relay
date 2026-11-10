@@ -5130,7 +5130,7 @@ const url = new URL(request.url);
 // 1,5 Mo max) ; la relecture /cosium-import-get par PEDLV reste soumise à la session du poste.
 // 10/11/2026 : /accueil-apps aussi — page d'accueil « Les outils du réseau » : sans connexion, seule la liste publique
 // des liens (section « tous ») est renvoyée ; les sections réservées exigent toujours la session Accueil.
-const ROUTES_SANS_SESSION = new Set(['/magasin-login', '/ar-login', '/accompagnement-login', '/accueil-login', '/poste-animateur', '/nutrition-log/ping', '/cle-usage', '/cosium-import', '/accueil-apps']);
+const ROUTES_SANS_SESSION = new Set(['/magasin-login', '/ar-login', '/accompagnement-login', '/accueil-login', '/poste-animateur', '/nutrition-log/ping', '/nutrition-log', '/cle-usage', '/cosium-import', '/accueil-apps']);
 const cleFermee = /^(oui|1|true)$/i.test(String(env.CLE_PARTAGEE_FERMEE || ''));
 if (request.headers.get('X-Store-Token') === STORE_SECRET && env.DB && url.hostname !== 'relais.interne'
   && !['X-Magasin-Session', 'X-Animateur-Session', 'X-AR-Session', 'X-Accomp-Session', 'X-Accueil-Session', 'X-Zimbra-Auth-Token', 'X-Notify-Token'].some(k => request.headers.get(k))) {
