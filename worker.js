@@ -2832,7 +2832,7 @@ const [bilans, notes, rhRows, rhElig, entretiens, lancements, kaizens, ratings, 
 q(`SELECT id, magasin_code, date, ca_annuel, data_json FROM (
 SELECT id, magasin_code, date, ca_annuel, data_json, ROW_NUMBER() OVER (PARTITION BY magasin_code ORDER BY date DESC, id DESC) AS rn
 FROM bilans WHERE date >= ? AND date <= ?) WHERE rn = 1`, debut, fin),
-q(`SELECT magasin_code, tache, note FROM notes_equipe WHERE annee = ? AND date_controle <= ?`, Number(mois.slice(0, 4)), fin),
+q(`SELECT magasin_code, tache, note FROM notes_equipe WHERE annee = ? AND (date_controle IS NULL OR date_controle = '' OR date_controle <= ?)`, Number(mois.slice(0, 4)), fin),
 qRh('mensuel-absences-etp', `SELECT es.mois AS mois, es.code_site AS code_site, SUM(es.poids * ${RH_COEF_ETP_SQL}) AS eff_total,
 SUM(CASE WHEN a.longue_duree = 1 THEN es.poids * ${RH_COEF_ETP_SQL} ELSE 0 END) AS eff_ld,
 SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
@@ -3157,14 +3157,15 @@ await calculerSanteMensuel(env, mois, 'Calcul automatique (1er du mois)');
 // 12/11/2026 (règle d'Olivier) : le niveau d'équipe est un cumul depuis la 1re évaluation
 // de l'année (3 meilleures notes par tâche, puis moyenne des tâches), lu DIRECTEMENT dans
 // les notes jusqu'à `fin` (AAAA-MM-JJ) : même calcul qu'Évaluation équipe et que le dashboard.
+// Les notes importées de l'historique n'ont pas de date de contrôle : elles comptent toujours (12/11).
 async function santeNiveauxEquipe(env, annee, fin) {
-const { results } = await env.DB.prepare(`SELECT magasin_code, tache, note, date_controle FROM notes_equipe WHERE annee = ? AND date_controle <= ?`).bind(annee, fin).all();
+const { results } = await env.DB.prepare(`SELECT magasin_code, tache, note, date_controle FROM notes_equipe WHERE annee = ? AND (date_controle IS NULL OR date_controle = '' OR date_controle <= ?)`).bind(annee, fin).all();
 const par = {};
 for (const n of (results || [])) {
 if (n.note === null || n.note === undefined) continue;
 const m = (par[n.magasin_code] ??= { taches: {}, dernier: null });
 (m.taches[n.tache] ??= []).push(Number(n.note));
-if (!m.dernier || String(n.date_controle) > m.dernier) m.dernier = String(n.date_controle);
+if (n.date_controle && (!m.dernier || String(n.date_controle) > m.dernier)) m.dernier = String(n.date_controle);
 }
 const out = {};
 for (const [code, m] of Object.entries(par)) {
