@@ -3154,6 +3154,42 @@ await calculerSanteMensuel(env, mois, 'Calcul automatique (1er du mois)');
 //   mois exclu pour ce magasin.
 // - Poids : ceux du dernier mois validé de l'année. Seuil de 50 % inchangé.
 // ===========================================================================
+// 12/11/2026 (règle d'Olivier) : le niveau d'équipe est un cumul depuis la 1re évaluation
+// de l'année (3 meilleures notes par tâche, puis moyenne des tâches), lu DIRECTEMENT dans
+// les notes jusqu'à `fin` (AAAA-MM-JJ) : même calcul qu'Évaluation équipe et que le dashboard.
+async function santeNiveauxEquipe(env, annee, fin) {
+const { results } = await env.DB.prepare(`SELECT magasin_code, tache, note, date_controle FROM notes_equipe WHERE annee = ? AND date_controle <= ?`).bind(annee, fin).all();
+const par = {};
+for (const n of (results || [])) {
+if (n.note === null || n.note === undefined) continue;
+const m = (par[n.magasin_code] ??= { taches: {}, dernier: null });
+(m.taches[n.tache] ??= []).push(Number(n.note));
+if (!m.dernier || String(n.date_controle) > m.dernier) m.dernier = String(n.date_controle);
+}
+const out = {};
+for (const [code, m] of Object.entries(par)) {
+const moyennes = Object.values(m.taches).map(arr => { const t = [...arr].sort((x, y) => y - x).slice(0, 3); return t.reduce((a, b) => a + b, 0) / t.length; });
+if (!moyennes.length) continue;
+out[code] = { niveau: santeArrondi1(moyennes.reduce((a, b) => a + b, 0) / moyennes.length), nbTaches: moyennes.length, dernierControle: m.dernier };
+}
+return out;
+}
+
+// Mois NON validé : le sous-score Équipe est remplacé par le niveau lu en direct (notes
+// jusqu'à la fin du mois). Un mois validé n'est jamais modifié (règle d'Olivier, 12/11).
+function santeRafraichirEquipe(lignes, niveaux) {
+let change = false;
+const out = lignes.map(l => {
+const e = niveaux[l.code]; if (!e) return l;
+const sousEq = Math.max(0, Math.min(100, (e.niveau / 10) * 100));
+const ancien = l.entrees && l.entrees.equipe ? l.entrees.equipe.niveau : null;
+if (l.sous && l.sous.equipe === sousEq && ancien === e.niveau) return l;
+change = true;
+return { ...l, sous: { ...l.sous, equipe: sousEq }, entrees: { ...l.entrees, equipe: { niveau: e.niveau, nbTaches: e.nbTaches, dernierControle: e.dernierControle } } };
+});
+return { lignes: out, change };
+}
+
 async function santeAnnuel(env, annee, stores, jusqua = null) {
 // jusqua (AAAA-MM, facultatif) : score annuel « à fin de ce mois » (Suivi Stats fige le score du mois traité).
 const debut = annee + '-01', fin = (jusqua && /^\d{4}-\d{2}$/.test(jusqua) && jusqua.slice(0, 4) === String(annee)) ? jusqua : annee + '-12';
@@ -3171,6 +3207,8 @@ try { sous = JSON.parse(r.sous_scores_json || '{}'); exclusions = JSON.parse(r.e
 (parCode[r.magasin_code] ??= []).push({ mois: r.mois, score: r.score, couverture: r.couverture, libelle: r.magasin_libelle, animateur: r.animateur, sous, exclusions, neutralisations });
 }
 const storesMap = new Map(stores.map(s => [s.code, s]));
+// 12/11/2026 : Équipe = niveau au dernier contrôle remonté (notes jusqu'à la fin de `jusqua`, sinon à ce jour).
+const niveauxEq = await santeNiveauxEquipe(env, annee, (jusqua && fin === jusqua) ? santeFinMois(jusqua) : annee + '-12-31');
 const magasins = [];
 for (const [code, lignes] of Object.entries(parCode)) {
 const st = storesMap.get(code) || {};
@@ -3178,7 +3216,14 @@ const derniereLigne = lignes[lignes.length - 1];
 const moisScores = lignes.map(l => ({ mois: l.mois, score: l.score ?? null, couverture: l.couverture ?? null, entier: !!l.neutralisations['*'] }));
 const retenus = lignes.filter(l => !l.neutralisations['*'] && l.score !== null && l.score !== undefined);
 const sous = {}, exclusions = {}, detail = {};
+const eqDirect = niveauxEq[code] || null;
+const derniereRetenue = retenus[retenus.length - 1];
 for (const d of SANTE_DIMS) {
+if (d === 'equipe' && eqDirect && derniereRetenue && !derniereRetenue.neutralisations[d]) {
+sous[d] = Math.max(0, Math.min(100, (eqDirect.niveau / 10) * 100));
+detail[d] = { mode: 'direct', nbMois: retenus.length, mois: [], niveau: eqDirect.niveau, dernierControle: eqDirect.dernierControle };
+continue;
+}
 const comptes = retenus.filter(l => !l.neutralisations[d] && !l.exclusions[d] && l.sous[d] !== null && l.sous[d] !== undefined);
 if (!comptes.length) {
 sous[d] = null;
@@ -3200,6 +3245,7 @@ magasins.push({
 code, libelle: st.libelle || derniereLigne.libelle || code, animateur: st.animateur || derniereLigne.animateur || null,
 score: final.score, couverture: final.couverture, nbMoisRetenus: retenus.length, nbMoisPresents: lignes.length,
 sous, exclusions, detail, moisScores,
+niveauEquipe: eqDirect ? eqDirect.niveau : null, dernierControleEquipe: eqDirect ? eqDirect.dernierControle : null,
 });
 }
 // Rangs (réseau et par AR) sur tous les magasins notés.
@@ -3245,7 +3291,13 @@ if (!moisOk(mois)) return jsonError('Mois invalide', 400, corsHeaders);
 const { results: moisCalcules } = await env.DB.prepare(`SELECT mois, statut, version FROM sante_mensuel_mois ORDER BY mois DESC`).all();
 const etat = await env.DB.prepare(`SELECT * FROM sante_mensuel_mois WHERE mois = ?`).bind(mois).first();
 let lignes, apercu = false, poids;
-if (etat) { lignes = await santeLignesVersion(env, mois, etat.version); poids = JSON.parse(etat.poids_json || '{}'); }
+if (etat) {
+lignes = await santeLignesVersion(env, mois, etat.version); poids = JSON.parse(etat.poids_json || '{}');
+if (etat.statut !== 'valide') {
+const r = santeRafraichirEquipe(lignes, await santeNiveauxEquipe(env, Number(mois.slice(0, 4)), santeFinMois(mois)));
+if (r.change) lignes = r.lignes.map(l => ({ ...l, ...santeScoreFinal(l.sous, l.exclusions || {}, new Set(Object.keys(l.neutralisations || {})), poids) }));
+}
+}
 else {
 // Aperçu indicatif (mois en cours ou mois non encore calculé) : rien n'est enregistré.
 apercu = true; poids = await getHealthWeights(env);
@@ -3361,8 +3413,12 @@ if (enAttente[0].n > 0) return jsonError(enAttente[0].n + ' proposition(s) de ne
 const { results: rhCount } = await env.DB.prepare(`SELECT COUNT(*) AS n FROM rh_agenda_mensuel WHERE mois = ?`).bind(mois).all();
 const motifSansRh = String(body.motifSansRh || '').trim();
 if (!rhCount[0].n && !motifSansRh) return jsonError('RH_ABSENT', 409, corsHeaders);
+// 12/11/2026 : le niveau d'équipe affiché avant validation est celui lu en direct ; on le fige tel quel.
+let versionValidee = etat.version;
+const rafr = santeRafraichirEquipe(await santeLignesVersion(env, mois, etat.version), await santeNiveauxEquipe(env, Number(mois.slice(0, 4)), santeFinMois(mois)));
+if (rafr.change) versionValidee = await santeEcrireVersion(env, mois, rafr.lignes, JSON.parse(etat.poids_json || '{}'), auteur);
 await env.DB.prepare(`UPDATE sante_mensuel_mois SET statut = 'valide', valide_le = ?, valide_par = ? WHERE mois = ?`).bind(now, auteur, mois).run();
-await santeJournal(env, mois, 'validation', { detail: { version: etat.version }, motif: motifSansRh ? 'Validé sans import RH : ' + motifSansRh : null, auteur });
+await santeJournal(env, mois, 'validation', { detail: { version: versionValidee, niveauEquipeActualise: rafr.change }, motif: motifSansRh ? 'Validé sans import RH : ' + motifSansRh : null, auteur });
 return json({ ok: true });
 }
 
