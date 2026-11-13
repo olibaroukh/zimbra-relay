@@ -2899,6 +2899,7 @@ try {
     repriseBilan[r.code] = { mois: r.mois, actions: so.actions, positionnement: so.positionnement, bilan: e.bilan };
   }
 } catch (e) { console.error('Reprise bilan (score santé) :', e); }
+const posSuivi = await positionnementsSuivi(mois);
 
 return stores.map(store => {
 const code = store.code;
@@ -2926,6 +2927,13 @@ sous.actions = 0; sous.positionnement = 0;
 entrees.bilan = null;
 propositions.push({ dimension: 'actions', motif: 'Aucun bilan de passage dans le mois' });
 propositions.push({ dimension: 'positionnement', motif: 'Aucun bilan de passage dans le mois' });
+}
+// Positionnement : Suivi Stats prioritaire sur le bilan (13/11/2026)
+const posS = posSuivi && posSuivi.parCode[String(code)];
+if (posS != null) {
+sous.positionnement = Math.max(0, Math.min(100, posS));
+entrees.positionnement = { source: 'suivi-stats', mois: posSuivi.mois, valeur: posS };
+const iP = propositions.findIndex(x => x.dimension === 'positionnement'); if (iP >= 0) propositions.splice(iP, 1);
 }
 
 // Équipe : niveau Évaluation équipe au dernier jour du mois (moyenne des
@@ -3692,7 +3700,8 @@ const niveauxEquipeMap = await getNiveauxEquipeMap(env);
 const kaizenHealthMap = await getKaizenHealthMap(env);
 const rhHealthMap = await getRhHealthSignalsMap(env);
 const entretiensLancementsMap = await getEntretiensLancementsMap(env);
-return { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap };
+const posSuivi = await positionnementsSuivi(null);
+return { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap, posSuivi };
 });
 }
 // Score santé hebdo : calculé pour tout le réseau et mis en cache (14/10), puis
@@ -3710,7 +3719,7 @@ return buildStoreHealthResultsD1(env, scope);
 }
 async function buildStoreHealthResultsD1(env, scope) {
 const todayISO = new Date().toISOString().slice(0, 10);
-const { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap } = await chargerDonneesSante(env);
+const { healthWeights, snapshots, lastObservationMap, ratingsMap, storeStatsMap, previousWeekPedlvMap, niveauxEquipeMap, kaizenHealthMap, rhHealthMap, entretiensLancementsMap, posSuivi } = await chargerDonneesSante(env);
 
 return scope.map(store => {
 const snap = snapshots[store.code] || null;
@@ -3732,7 +3741,8 @@ overdue: lastVisitDate === null || daysSinceVisit >= VISIT_REMINDER_THRESHOLD_DA
 effectif: computeEffectifStatus(snap, store.effTheo, rhSignal),
 effectifRH: computeEffectifRH(rhSignal, store.effTheo),
 absenteisme: { score: rhSignal ? rhSignal.absenteismeScore : null, moisCount: rhSignal ? rhSignal.moisCount : 0 },
-positionnementAnnuel: snap ? snap.positionnementAnnuel : null,
+positionnementAnnuel: (posSuivi && posSuivi.parCode[String(store.code)] != null) ? posSuivi.parCode[String(store.code)] : (snap ? snap.positionnementAnnuel : null),
+positionnementAnnuelSource: (posSuivi && posSuivi.parCode[String(store.code)] != null) ? { source: 'suivi-stats', mois: posSuivi.mois } : (snap && snap.positionnementAnnuel != null ? { source: 'bilan', date: snap.date } : null),
 googleRating: ratingsMap[store.code] || null,
 actionsNonSoldees: snap ? {
 count: (snap.actions || []).length,
@@ -3791,6 +3801,17 @@ function toNumOrNull(v) {
 if (v === undefined || v === null || v === '') return null;
 const n = parseFloat(v);
 return Number.isFinite(n) ? n : null;
+}
+
+// 13/11/2026 (consigne d'Olivier) : critère Positionnement du score santé = dernier positionnement annuel de
+// Suivi Stats (cumul à fin du mois traité, sinon dernier mois enregistré avant) au lieu de la saisie du bilan.
+// Repli sur le bilan si le lien Suivi Stats est indisponible ou si le magasin n'y figure pas.
+async function positionnementsSuivi(mois) {
+try {
+if (!_suiviBinding || typeof _suiviBinding.positionnementsAnnuels !== 'function') return null;
+const r = await _suiviBinding.positionnementsAnnuels(mois || null);
+return r && r.mois ? r : null;
+} catch (e) { console.error('Positionnements Suivi Stats :', e); return null; }
 }
 
 async function getLastBilanSnapshots(env) {
