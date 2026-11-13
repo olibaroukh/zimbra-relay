@@ -2771,7 +2771,8 @@ return { jour, today, maintenant, butoir: LANCEMENT_HEURE_BUTOIR, magasins: Obje
 const SANTE_REGLES_VERSION = '2026-10-03';
 const SANTE_DIMS = ['actions', 'effectif', 'absenteisme', 'positionnement', 'pedlv', 'avis', 'equipe', 'kaizen', 'entretiens', 'lancements'];
 // D5 : un AR absent neutralise tout ce qui vient de Bilan de Passage et d'Évaluation équipe.
-const SANTE_DIMS_AR_ABSENT = ['actions', 'positionnement', 'equipe'];
+// 13/11/2026 : Positionnement retiré (lu dans Suivi Stats, ne dépend plus du passage de l'animateur)
+const SANTE_DIMS_AR_ABSENT = ['actions', 'equipe'];
 const SANTE_SEUIL_COUVERTURE = 0.5; // D6
 const SANTE_AVIS_PERIME_JOURS = 35;
 const SANTE_MOIS_NOMS = {
