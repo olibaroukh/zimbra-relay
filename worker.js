@@ -9608,6 +9608,24 @@ if (/^(f|femme|feminin|mme|madame)/.test(g)) o.femmes += r.n || 0; else if (/^(h
 }
 return { mois: moisRh, magasins: out };
 }
+async rhAbsenteisme(mois) {
+// 20/11/2026 : absentéisme cumulé de janvier au mois indiqué, par magasin, pour les cockpits Suivi Stats.
+// MÊME définition que la dimension « absentéisme » du score santé : jours des motifs du groupe A (RH_GROUPE_A_COLS,
+// longue durée incluse) / jours ouvrés théoriques, pondérés par site (multi-sites). Seuls les totaux de jours sont
+// transmis (aucune donnée individuelle) ; Suivi Stats recalcule le taux à chaque niveau (magasin, AR, groupe).
+const m = String(mois || ''); if (!/^\d{4}-\d{2}$/.test(m)) return { moisRh: [], magasins: {} };
+const { results } = await this.env.DB.prepare(`SELECT es.mois AS mois, es.code_site AS code, SUM(a.jours_groupe_a * es.poids) AS ga, SUM(a.jours_ouvres_theoriques * es.poids) AS th
+FROM rh_effectif_site_mensuel es JOIN rh_agenda_mensuel a ON a.mois = es.mois AND a.matricule = es.matricule
+WHERE es.site_reconnu = 1 AND es.mois >= ? AND es.mois <= ? GROUP BY es.mois, es.code_site`).bind(m.slice(0, 4) + '-01', m).all();
+const out = {}, moisVus = new Set();
+for (const r of (results || [])) {
+moisVus.add(r.mois);
+const o = out[String(r.code)] = out[String(r.code)] || { absence: 0, theorique: 0, nbMois: 0 };
+o.absence += r.ga || 0; o.theorique += r.th || 0; o.nbMois++;
+}
+for (const c in out) { out[c].absence = Math.round(out[c].absence * 100) / 100; out[c].theorique = Math.round(out[c].theorique * 100) / 100; }
+return { moisRh: [...moisVus].sort(), magasins: out, motifs: RH_GROUPE_A_COLS };
+}
 async iddigitalEnvoyer(type, code, pdfB64, nomFichier) {
 try { return await iddEnvoyer(this.env, type, code, pdfB64, nomFichier); }
 catch (e) { return { ok: false, code, erreur: String(e && e.message || e) }; }
