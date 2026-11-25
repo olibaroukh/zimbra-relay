@@ -3029,9 +3029,11 @@ if (!elig.size) { sous.entretiens = null; exclusions.entretiens = 'Aucun collabo
 else if (!att.attendus) { sous.entretiens = null; exclusions.entretiens = 'Tout l\'effectif est en absence longue durée (' + att.absLd + ')'; }
 else {
 const v = vus[code] || new Set(); let n = 0; elig.forEach(m => { if (v.has(normMatricule(m))) n++; });
-n = Math.min(n, att.attendus);
-sous.entretiens = Math.round((n / att.attendus) * 100);
-entrees.entretiens = { eligibles: att.attendus, effectifHorsManager: att.effectif, absencesLongueDuree: att.absLd, sourceAbsences: att.source, vus: n, rhMois: rhMoisEligibles };
+// 25/11/2026 (cas Écoles) : un collaborateur déclaré en absence longue durée mais vu quand même
+// compte au numérateur ET au dénominateur (3/3 au lieu de 2/2) ; le taux reste plafonné à 100 %.
+const attendusAff = Math.max(att.attendus, n);
+sous.entretiens = Math.min(100, Math.round((n / att.attendus) * 100));
+entrees.entretiens = { eligibles: attendusAff, effectifHorsManager: att.effectif, absencesLongueDuree: att.absLd, sourceAbsences: att.source, vus: n, rhMois: rhMoisEligibles };
 }
 }
 
@@ -3669,10 +3671,12 @@ const att = entretiensAttendus(elig, absBilanParMagasin[code]);
 const vus = vusParMagasin[code] || new Set();
 let nbVusBrut = 0;
 eligibles.forEach(m => { if (vus.has(normMatricule(m))) nbVusBrut++; });
-// Un collaborateur en longue durée vu quand même ne fait pas dépasser 100 %.
-const nbVus = Math.min(nbVusBrut, att.attendus);
+// 25/11/2026 (cas Écoles) : un collaborateur en longue durée vu quand même compte au numérateur
+// ET au dénominateur (3/3 au lieu de 2/2) ; le taux reste plafonné à 100 %.
+const nbVus = nbVusBrut;
+const nbLdVus = Math.max(0, nbVusBrut - att.attendus);
 // Tout l'effectif en longue durée : rien d'attendu, donc rien de manquant.
-const tauxEntretiens = att.attendus > 0 ? Math.round((nbVus / att.attendus) * 100) : (att.effectif > 0 ? 100 : 0);
+const tauxEntretiens = att.attendus > 0 ? Math.min(100, Math.round((nbVus / att.attendus) * 100)) : (att.effectif > 0 ? 100 : 0);
 
 const joursOuverts = joursOuvertsParMagasin[code];
 const joursLances = lancementsParMagasin[code] || 0;
@@ -3699,7 +3703,7 @@ const nbRemotivation = tc.remotivation || 0;
 
 map[code] = {
 // nbEligibles = entretiens ATTENDUS (hors manager, absences longue durée déduites).
-tauxEntretiens, nbEligibles: att.attendus, nbVus, nbEffectif: att.effectif, nbAbsencesLd: att.absLd, sourceAbsencesLd: att.source,
+tauxEntretiens, nbEligibles: att.attendus + nbLdVus, nbLdVus, nbVus, nbEffectif: att.effectif, nbAbsencesLd: att.absLd, sourceAbsencesLd: att.source,
 tauxLancements, joursOuverts: joursOuverts || 0, joursLances,
 nbPilotage, nbEcouteFb, nbRecadrage, nbValorisation, nbRemotivation, nbLancements: joursLances,
 nonVus, nonComptes,
