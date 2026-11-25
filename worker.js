@@ -2874,7 +2874,7 @@ const rhImportPresent = rhRows.some(r => r.mois === mois);
 const motifRhAbsent = rhImportPresent ? 'Aucun salarié rattaché à ce magasin dans l\'import RH du mois' : 'Import RH du mois absent';
 const eligibles = rhEligiblesParMagasin(rhElig, stores); // hors manager (08/10)
 const absBilan = await getAbsencesLdBilans(env, mois);
-const vus = {}; entretiens.forEach(r => { (vus[r.magasin_code] ??= new Set()).add(r.collaborateur_matricule); });
+const vus = {}; entretiens.forEach(r => { const m = normMatricule(r.collaborateur_matricule); if (m) (vus[r.magasin_code] ??= new Set()).add(m); });
 const lancParCode = {}; lancements.forEach(r => { lancParCode[r.magasin_code] = r.jours; });
 const kaizenParCode = {}; kaizens.forEach(r => { kaizenParCode[r.magasin_code] = r; });
 const ratingParCode = {}; ratings.forEach(r => { ratingParCode[r.magasin_code] = r; });
@@ -3028,7 +3028,7 @@ const att = entretiensAttendus(eg, absBilan[code]);
 if (!elig.size) { sous.entretiens = null; exclusions.entretiens = 'Aucun collaborateur éligible (RH ' + rhMoisEligibles + ')'; }
 else if (!att.attendus) { sous.entretiens = null; exclusions.entretiens = 'Tout l\'effectif est en absence longue durée (' + att.absLd + ')'; }
 else {
-const v = vus[code] || new Set(); let n = 0; elig.forEach(m => { if (v.has(m)) n++; });
+const v = vus[code] || new Set(); let n = 0; elig.forEach(m => { if (v.has(normMatricule(m))) n++; });
 n = Math.min(n, att.attendus);
 sous.entretiens = Math.round((n / att.attendus) * 100);
 entrees.entretiens = { eligibles: att.attendus, effectifHorsManager: att.effectif, absencesLongueDuree: att.absLd, sourceAbsences: att.source, vus: n, rhMois: rhMoisEligibles };
@@ -3511,6 +3511,8 @@ const TYPES_ENTRETIENS_COMPTES = ['pilotage_optique', 'pilotage_audio', 'recadra
 // Absences longue durée : case du bilan de passage (pré-remplie depuis l'import
 // RH, modifiable par l'AR) — dernier bilan daté entre le 1er du mois précédent
 // et la fin du mois ; à défaut, décompte RH (longue_duree = 1, hors manager).
+// 25/11/2026 : matricule comparé sans zéros en tête, espaces ni « .0 » (export RH vs saisie Suivi magasin).
+function normMatricule(v) { const x = String(v == null ? '' : v).trim().replace(/\.0+$/, '').replace(/^0+(?=\d)/, ''); return x || null; }
 function rhEstPosteManager(poste) {
 return String(poste || '').trim().toLowerCase() === 'manager';
 }
@@ -3604,8 +3606,21 @@ AND collaborateur_matricule IS NOT NULL`
 } catch (e) {}
 const vusParMagasin = {};
 entretienRows.forEach(r => {
-(vusParMagasin[r.magasin_code] = vusParMagasin[r.magasin_code] || new Set()).add(r.collaborateur_matricule);
+const m = normMatricule(r.collaborateur_matricule);
+if (m) (vusParMagasin[r.magasin_code] = vusParMagasin[r.magasin_code] || new Set()).add(m);
 });
+// 25/11/2026 (cas Vélizy) : détail affiché dans le dashboard — collaborateurs attendus non vus
+// et entretiens du mois qui ne comptent pas, avec la raison.
+const nomRh = {};
+eligibleRows.forEach(r => { const m = normMatricule(r.matricule); if (m) nomRh[r.code_site + '|' + m] = [r.prenom, r.nom].filter(Boolean).join(' ').trim(); });
+let tousEntretiensMois = [];
+try {
+({ results: tousEntretiensMois } = await env.DB.prepare(
+`SELECT magasin_code, type, collaborateur_matricule, collaborateur_nom, date FROM entretiens_manager WHERE date LIKE ? ORDER BY date, id`
+).bind(moisActuel + '%').all());
+} catch (e) {}
+const entretiensMoisParMagasin = {};
+(tousEntretiensMois || []).forEach(r => { (entretiensMoisParMagasin[r.magasin_code] = entretiensMoisParMagasin[r.magasin_code] || []).push(r); });
 
 // Jours attendus par magasin (26/09) — calendrier réseau commun, seule
 // différence possible entre magasins : l'Alsace-Moselle (2 fériés de plus).
@@ -3653,7 +3668,7 @@ const eligibles = elig ? elig.eligibles : new Set();
 const att = entretiensAttendus(elig, absBilanParMagasin[code]);
 const vus = vusParMagasin[code] || new Set();
 let nbVusBrut = 0;
-eligibles.forEach(m => { if (vus.has(m)) nbVusBrut++; });
+eligibles.forEach(m => { if (vus.has(normMatricule(m))) nbVusBrut++; });
 // Un collaborateur en longue durée vu quand même ne fait pas dépasser 100 %.
 const nbVus = Math.min(nbVusBrut, att.attendus);
 // Tout l'effectif en longue durée : rien d'attendu, donc rien de manquant.
@@ -3663,6 +3678,18 @@ const joursOuverts = joursOuvertsParMagasin[code];
 const joursLances = lancementsParMagasin[code] || 0;
 const tauxLancements = joursOuverts ? Math.min(100, Math.round((joursLances / joursOuverts) * 100)) : 0;
 
+const eligNorm = new Set([...eligibles].map(normMatricule).filter(Boolean));
+const nonVus = [...eligNorm].filter(m => !vus.has(m)).map(m => nomRh[code + '|' + m] || ('matricule ' + m));
+const dejaVus = new Set(), nonComptes = [];
+(entretiensMoisParMagasin[code] || []).forEach(r => {
+const m = normMatricule(r.collaborateur_matricule), nom = r.collaborateur_nom || (m ? 'matricule ' + m : '?');
+let raison = null;
+if (!TYPES_ENTRETIENS_COMPTES.includes(r.type)) raison = r.type === 'ecoute_fb' ? 'Écoute & Feedback : hors comptage' : 'type non compté (' + r.type + ')';
+else if (!m) raison = 'collaborateur sans matricule (saisi à la main)';
+else if (!eligNorm.has(m)) raison = 'absent de l\'effectif RH du magasin (dernier export RH)';
+else if (dejaVus.has(m)) raison = 'collaborateur déjà vu ce mois-ci';
+if (raison) nonComptes.push({ nom, date: r.date, raison }); else dejaVus.add(m);
+});
 const tc = typeCountsParMagasin[code] || {};
 const nbPilotage = (tc.pilotage_optique || 0) + (tc.pilotage_audio || 0) + (tc.recadrage || 0); // recadrage compté (08/10)
 const nbEcouteFb = tc.ecoute_fb || 0;
@@ -3675,6 +3702,7 @@ map[code] = {
 tauxEntretiens, nbEligibles: att.attendus, nbVus, nbEffectif: att.effectif, nbAbsencesLd: att.absLd, sourceAbsencesLd: att.source,
 tauxLancements, joursOuverts: joursOuverts || 0, joursLances,
 nbPilotage, nbEcouteFb, nbRecadrage, nbValorisation, nbRemotivation, nbLancements: joursLances,
+nonVus, nonComptes,
 };
 });
 return map;
