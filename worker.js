@@ -9099,6 +9099,11 @@ return jsonError('Payload invalide : magasin_code, mois, item_id et controleur r
 // (route /kaizen-lock) ou que le mois suivant ne remette l'audit à zéro.
 // Sans session valide, sessionAr est null (comportement magasin inchangé).
 const sessionAr = await verifyArSession(request.headers.get('X-AR-Session'));
+// 25/11/2026 (cas Victor Hugo) : un magasin ne coche que l'audit du mois en cours (heure de Paris) ;
+// une page restée ouverte depuis le mois précédent enregistrait dans l'ancien audit.
+if (!sessionAr && mois !== parisTodayIso().slice(0, 7)) {
+return jsonError('Nous avons changé de mois : recharge la page pour ouvrir l\'audit du mois en cours.', 409, corsHeaders);
+}
 
 try {
 const stores = await getMagasinsServerSide();
