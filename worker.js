@@ -3514,6 +3514,8 @@ const TYPES_ENTRETIENS_COMPTES = ['pilotage_optique', 'pilotage_audio', 'recadra
 // RH, modifiable par l'AR) — dernier bilan daté entre le 1er du mois précédent
 // et la fin du mois ; à défaut, décompte RH (longue_duree = 1, hors manager).
 // 25/11/2026 : matricule comparé sans zéros en tête, espaces ni « .0 » (export RH vs saisie Suivi magasin).
+// 26/11/2026 : mois AAAA-MM décalé de n mois (écran Anomalies)
+function moisDecaleIso(m, n) { const [a, mo] = m.split('-').map(Number); const d = new Date(Date.UTC(a, mo - 1 + n, 1)); return d.toISOString().slice(0, 7); }
 function normMatricule(v) { const x = String(v == null ? '' : v).trim().replace(/\.0+$/, '').replace(/^0+(?=\d)/, ''); return x || null; }
 function rhEstPosteManager(poste) {
 return String(poste || '').trim().toLowerCase() === 'manager';
@@ -9671,6 +9673,35 @@ async iddigitalTest() {
 // Test de connexion IDdigital : connexion + liste des magasins accessibles ; rien n'est envoyé aux écrans
 try { const m = await iddMagasins(this.env); return { ok: true, base: m.base, variante: m.variante, nb: m.magasins.length, magasins: m.magasins.slice(0, 400), brut: m.brut }; }
 catch (e) { return { ok: false, erreur: String(e && e.message || e), essais: e && e.essais ? e.essais : null }; }
+}
+// 26/11/2026 : écran « Anomalies » de Suivi Stats (contrôle quotidien) — ce qu'un magasin aurait sinon signalé lui-même
+// (cas Vélizy, Victor Hugo, 1056, Écoles). Lecture seule.
+async anomalies() {
+chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
+const env = this.env, mois = parisTodayIso().slice(0, 7), items = [];
+const stores = await getMagasinsServerSide(); const st = {}; stores.forEach(x => st[String(x.code)] = x);
+const ajoute = (type, code, detail, action, extra) => { const x = st[String(code)] || {}; items.push(Object.assign({ type, code: String(code), libelle: x.libelle || '', animateur: x.animateur || '', detail, action }, extra || {})); };
+const fr = d => d ? String(d).slice(8, 10) + '/' + String(d).slice(5, 7) + '/' + String(d).slice(0, 4) : '';
+// 1. Audits Kaizen d'un mois passé jamais clôturés (page restée ouverte, audit créé après la clôture du 1er)
+try { const { results } = await env.DB.prepare(`SELECT id, magasin_code, mois, score, score_max, created_at FROM kaizen_audits WHERE closed = 0 AND mois < ? ORDER BY mois`).bind(mois).all();
+(results || []).forEach(r => ajoute('kaizen_non_cloture', r.magasin_code, `Audit Kaizen « ${r.mois} » (${r.score}/${r.score_max}) créé le ${fr(r.created_at)}, jamais clôturé ni compté`, `D1 : vérifier les audits du magasin puis supprimer la ligne ${r.id} ou la basculer sur le bon mois`, { id: r.id })); } catch (e) {}
+// 2. Entretiens et lancements datés d'un mois antérieur à leur envoi (brouillon d'un mois passé) — 2 derniers mois d'envoi
+const depuis = moisDecaleIso(mois, -1) + '-01';
+try { const { results } = await env.DB.prepare(`SELECT id, magasin_code, type, collaborateur_nom, date, created_at FROM entretiens_manager WHERE created_at >= ? AND substr(date, 1, 7) < substr(created_at, 1, 7)`).bind(depuis).all();
+(results || []).forEach(r => ajoute('entretien_date_passee', r.magasin_code, `Entretien ${r.type} (${r.collaborateur_nom || '?'}) daté du ${fr(r.date)} mais envoyé le ${fr(r.created_at)} : compté sur le mauvais mois`, `D1 : UPDATE entretiens_manager SET date = substr(created_at, 1, 10) WHERE id = ${r.id};`, { id: r.id })); } catch (e) {}
+try { const { results } = await env.DB.prepare(`SELECT id, magasin_code, date, created_at FROM lancements_journee WHERE created_at >= ? AND substr(date, 1, 7) < substr(created_at, 1, 7)`).bind(depuis).all();
+(results || []).forEach(r => ajoute('lancement_date_passee', r.magasin_code, `Lancement de journée daté du ${fr(r.date)} mais envoyé le ${fr(r.created_at)}`, `D1 : UPDATE lancements_journee SET date = substr(created_at, 1, 10) WHERE id = ${r.id};`, { id: r.id })); } catch (e) {}
+// 3. Entretiens du mois non comptés (hors Écoute & Feedback et 2e entretien d'un même collaborateur, voulus)
+// 4. Absences longue durée déclarées au bilan mais collaborateur vu en entretien
+try { const map = await getEntretiensLancementsMap(env, mois);
+for (const [code, e] of Object.entries(map || {})) {
+(e.nonComptes || []).filter(x => /matricule|effectif RH/.test(x.raison)).forEach(x => ajoute('entretien_non_compte', code, `Entretien de ${x.nom} du ${fr(x.date)} non compté : ${x.raison}`, /matricule/.test(x.raison) ? 'Le manager doit choisir le collaborateur dans la liste (pas de saisie à la main)' : 'Vérifier l’export RH du magasin (import RH dans bilan-passage)'));
+if (e.nbLdVus) ajoute('ld_contredite', code, `${e.nbLdVus} collaborateur(s) déclaré(s) en absence longue durée au dernier bilan mais vu(s) en entretien ce mois-ci`, 'L’AR corrige l’absence longue durée au prochain bilan de passage');
+} } catch (e) {}
+// 5. Brouillons Suivi magasin d'un mois passé jamais envoyés
+try { const { results } = await env.DB.prepare(`SELECT id, magasin_code, ecran, libelle, cree_par, created_at FROM brouillons_suivi WHERE substr(created_at, 1, 7) < ?`).bind(mois).all();
+(results || []).forEach(r => ajoute('brouillon_ancien', r.magasin_code, `Brouillon « ${r.libelle || r.ecran} » (${r.cree_par || '?'}) commencé le ${fr(r.created_at)} et jamais envoyé`, 'Le manager l’envoie (la date sera mise au jour de l’envoi) ou le supprime')); } catch (e) {}
+return { ok: true, mois, genereLe: new Date().toISOString(), items };
 }
 async listePins() {
 chargerClesSession(this.env); _suiviBinding = this.env.SUIVI || null; _suiviEnvDB = this.env.DB || null;
