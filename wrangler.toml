@@ -30,7 +30,7 @@ bucket_name = "kaizen-photos"
 
 # Tâches planifiées : expressions exactes attendues par scheduled() dans worker.js
 [triggers]
-crons = ["0 8 1 * *", "0 6 * * SUN", "0 4 * * MON", "0 20 * * SUN", "0 14 * * SUN"]
+crons = ["0 8 1 * *", "0 6 * * SUN", "0 4 * * MON", "0 20 * * SUN", "0 14 * * SUN", "0 7 25 * *", "0 8 25 * *"]
 
 [observability]
 enabled = true
