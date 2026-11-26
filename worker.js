@@ -307,7 +307,7 @@ code: String(m.code || '').trim(), libelle: m.libelle || '', animateur: m.animat
 email: m.email || '', googlePlaceId: m.googlePlaceId || '', concept: m.concept || '', meubleVitrine: !!m.meubleVitrine,
 presentoirVerres: !!m.presentoirVerres, alsaceMoselle: !!m.alsaceMoselle, effTheo: m.effTheo == null ? null : m.effTheo,
 manager: m.manager || '', objectifAnnuel: m.objectifAnnuel == null ? null : m.objectifAnnuel,
-effOpt: m.effOpt, effAudio: m.effAudio, statut: m.statut || '', source: 'suivi-stats',
+effOpt: m.effOpt, effAudio: m.effAudio, statut: m.statut || '', pays: m.pays || '', type: m.type || '', source: 'suivi-stats',
 })).filter(x => x.code);
 } catch (e) { console.error('Référentiel Suivi Stats indisponible, repli sur magasins.csv :', e); return null; }
 }
@@ -1001,6 +1001,52 @@ const j = await r.json().catch(() => null);
 if (!r.ok) throw new Error('getStore : HTTP ' + r.status);
 const liste = Array.isArray(j) ? j : (j && (j.stores || j.data || j.result || j.magasins)) || [];
 return { base: c.base, variante: c.variante, magasins: Array.isArray(liste) ? liste : [], brut: Array.isArray(liste) ? null : j };
+}
+
+// ---------- Rappel de fin de mois aux AR (26/11/2026) ----------
+// Le 25 à 9 h (heure de Paris) : chaque AR des SUCCURSALES FRANCE reçoit, pour ses magasins, ce qu'il reste à faire
+// avant la clôture du mois : collaborateurs pas encore vus en entretien et audit Kaizen non commencé / non terminé.
+// Copie réseau à Olivier. test = true : un seul mail à Olivier avec toutes les sections, rien n'est envoyé aux AR.
+async function rappelFinDeMoisAR(env, test) {
+_suiviBinding = env.SUIVI || null; _suiviEnvDB = env.DB || null;
+const mois = parisTodayIso().slice(0, 7), [an, mo] = mois.split('-').map(Number);
+const MOISL = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+const fin = new Date(Date.UTC(an, mo, 0)).getUTCDate(), libMois = `${MOISL[mo - 1]} ${an}`;
+const stores = (await getMagasinsServerSide()).filter(x => x.statut !== 'franchise' && (!x.pays || x.pays === 'FRANCE') && x.animateur && x.animateurEmail);
+const map = await getEntretiensLancementsMap(env, mois);
+const { results: aud } = await env.DB.prepare('SELECT magasin_code, score, score_max FROM kaizen_audits WHERE mois = ?').bind(mois).all();
+const kz = {}; (aud || []).forEach(r => kz[String(r.magasin_code)] = r);
+const parAr = {};
+for (const st of stores) {
+const e = map[st.code] || {}, k = kz[st.code];
+const restant = e.nbEligibles ? Math.max(0, e.nbEligibles - (e.nbVus || 0)) : 0;
+const kaizen = !st.concept ? null : !k ? 'pas commencé' : (k.score_max && k.score < k.score_max ? `en cours (${k.score} / ${k.score_max})` : null);
+if (!restant && !kaizen) { (parAr[st.animateurEmail.toLowerCase()] ??= { nom: st.animateur, lignes: [], ok: 0 }).ok++; continue; }
+(parAr[st.animateurEmail.toLowerCase()] ??= { nom: st.animateur, lignes: [], ok: 0 }).lignes.push([
+`${st.libelle} (${st.code})`,
+e.nbEligibles ? (restant ? `${restant} restant(s) sur ${e.nbEligibles}${(e.nonVus || []).length ? ' — pas encore vus : ' + e.nonVus.join(', ') : ''}` : '✓ à jour') : '—',
+kaizen || '✓',
+]);
+}
+const section = (a, avecNom) => {
+const tete = avecNom ? `<h3 style="font-family:Arial,Helvetica,sans-serif;color:#CC1719;font-size:14px;margin:18px 0 4px">${escapeHtml(a.nom)}</h3>` : '';
+if (!a.lignes.length) return tete + `<p style="font-family:Arial,Helvetica,sans-serif;font-size:13px;margin:0 0 12px">✓ Tous tes magasins sont à jour (${a.ok}).</p>`;
+return tete + htmlStatsTable(['Magasin', 'Entretiens individuels', 'Kaizen'], a.lignes) + (a.ok ? `<p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#666;margin:-12px 0 12px">${a.ok} autre(s) magasin(s) à jour.</p>` : '');
+};
+const intro = nom => `<p style="font-family:Arial,Helvetica,sans-serif;font-size:13px">Bonjour ${escapeHtml(nom || '')},</p><p style="font-family:Arial,Helvetica,sans-serif;font-size:13px">Il reste ${fin - +parisTodayIso().slice(8, 10) + 1} jour(s) avant la clôture de <b>${libMois}</b> (le 1er à 9 h, les audits Kaizen sont clôturés et les entretiens du mois sont comptés). Voici ce qu'il reste à faire dans tes magasins :</p>`;
+const pied = `<p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#666">Entretiens : un par collaborateur (hors manager et absences longue durée), tous types sauf Écoute &amp; Feedback, choisis dans la liste de Suivi magasin. Kaizen : audit du mois à terminer dans l'appli Kaizen.</p>`;
+const ars = Object.values(parAr).sort((a, b) => a.nom.localeCompare(b.nom, 'fr'));
+let n = 0;
+if (test) {
+await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject: `TEST – Fin de ${libMois} : ce qu'il reste à faire (rappel du 25 aux AR)`, bodyHtml: wrapEmailBody(`<p style="font-family:Arial,Helvetica,sans-serif;font-size:13px"><b>Test :</b> voici ce que chaque AR recevrait aujourd'hui (rien ne leur a été envoyé).</p>` + ars.map(a => section(a, true)).join('') + pied) });
+return { ok: true, detail: `Test envoyé à ${OLIVIER_EMAIL} (${ars.length} AR, ${ars.reduce((x, a) => x + a.lignes.length, 0)} magasin(s) avec quelque chose à faire)` };
+}
+for (const [email, a] of Object.entries(parAr)) {
+try { await zimbraSendMail(env, { to: email, subject: `Fin de ${libMois} : ce qu'il reste à faire dans tes magasins`, bodyHtml: wrapEmailBody(intro(a.nom) + section(a, false) + pied) }); n++; }
+catch (e) { console.error('Rappel du 25 échoué pour', email, e); }
+}
+await zimbraSendMail(env, { to: OLIVIER_EMAIL, subject: `Fin de ${libMois} : rappel envoyé à ${n} AR (copie réseau)`, bodyHtml: wrapEmailBody(ars.map(a => section(a, true)).join('') + pied) });
+return { ok: true, detail: `Rappel envoyé à ${n} AR` };
 }
 
 // ---------- Rappel mensuel aux AR : critères manuels Managers Leaders / Magasins d'Excellence (05/11/2026) ----------
@@ -9594,6 +9640,10 @@ ctx.waitUntil(clotureKaizen);
 ctx.waitUntil(clotureKaizen.then(() => withCronAlert(env, 'Score de santé mensuel (provisoire)', () => calculerSanteMensuelProvisoireCron(env))));
 ctx.waitUntil(withCronAlert(env, 'Rappel import RH', () => sendRhImportReminder(env)));
 ctx.waitUntil(withCronAlert(env, 'Rappel Managers Leaders / Magasins d’Excellence', () => envoyerRappelMlme(env)));
+} else if (cron === '0 7 25 * *' || cron === '0 8 25 * *') {
+// 26/11/2026 : rappel de fin de mois aux AR le 25 à 9 h (heure de Paris) ; deux déclenchements, seul celui de 9 h envoie (été / hiver)
+const hP = +new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', hour12: false }).format(new Date(event.scheduledTime || Date.now()));
+if (hP === 9) ctx.waitUntil(withCronAlert(env, 'Rappel de fin de mois aux AR', () => rappelFinDeMoisAR(env, false)));
 } else if (cron === '0 4 * * MON' || cron === '0 4 * * WED' || cron === '0 4 * * FRI') {
 ctx.waitUntil(withCronAlert(env, 'Refresh Google ratings', () => refreshGoogleRatings(env)));
 } else {
@@ -9708,6 +9758,7 @@ try { const { results } = await env.DB.prepare(`SELECT id, magasin_code, ecran, 
 (results || []).forEach(r => ajoute('brouillon_ancien', r.magasin_code, `Brouillon « ${r.libelle || r.ecran} » (${r.cree_par || '?'}) commencé le ${fr(r.created_at)} et jamais envoyé`, `${r.cree_par || 'Son auteur'} l’envoie (la date sera mise au jour de l’envoi) ou le supprime`, null, 'br:' + r.id)); } catch (e) {}
 return { ok: true, mois, genereLe: new Date().toISOString(), items };
 }
+async rappelFinDeMoisAR(test) { return rappelFinDeMoisAR(this.env, test !== false); }
 async anomalieVue(cle, par) {
 const c = String(cle || '').slice(0, 300); if (!c) return { ok: false, erreur: 'clé absente' };
 await this.env.DB.prepare(`CREATE TABLE IF NOT EXISTS anomalies_vues (cle TEXT PRIMARY KEY, par TEXT, le TEXT DEFAULT (datetime('now')))`).run();
