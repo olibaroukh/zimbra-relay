@@ -9642,7 +9642,9 @@ ctx.waitUntil(withCronAlert(env, 'Rappel import RH', () => sendRhImportReminder(
 ctx.waitUntil(withCronAlert(env, 'Rappel Managers Leaders / Magasins d’Excellence', () => envoyerRappelMlme(env)));
 } else if (cron === '0 7 25 * *' || cron === '0 8 25 * *') {
 // 26/11/2026 : rappel de fin de mois aux AR le 25 à 9 h (heure de Paris) ; deux déclenchements, seul celui de 9 h envoie (été / hiver)
-const hP = +new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', hour: '2-digit', hour12: false }).format(new Date(event.scheduledTime || Date.now()));
+// 27/11/2026 : l'heure était lue « 09 h » (format français) → nombre invalide → rappel jamais envoyé ; seule la partie « heure » est prise.
+const pH = new Intl.DateTimeFormat('fr-FR', { timeZone: 'Europe/Paris', hour: 'numeric', hourCycle: 'h23' }).formatToParts(new Date(event.scheduledTime || Date.now())).find(x => x.type === 'hour');
+const hP = pH ? +pH.value : -1;
 if (hP === 9) ctx.waitUntil(withCronAlert(env, 'Rappel de fin de mois aux AR', () => rappelFinDeMoisAR(env, false)));
 } else if (cron === '0 4 * * MON' || cron === '0 4 * * WED' || cron === '0 4 * * FRI') {
 ctx.waitUntil(withCronAlert(env, 'Refresh Google ratings', () => refreshGoogleRatings(env)));
