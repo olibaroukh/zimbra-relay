@@ -5292,8 +5292,22 @@ const url = new URL(request.url);
 // des liens (section « tous ») est renvoyée ; les sections réservées exigent toujours la session Accueil.
 const ROUTES_SANS_SESSION = new Set(['/magasin-login', '/ar-login', '/accompagnement-login', '/accueil-login', '/poste-animateur', '/nutrition-log/ping', '/nutrition-log', '/cle-usage', '/cosium-import', '/accueil-apps']);
 const cleFermee = /^(oui|1|true)$/i.test(String(env.CLE_PARTAGEE_FERMEE || ''));
-if (request.headers.get('X-Store-Token') === STORE_SECRET && env.DB && url.hostname !== 'relais.interne'
-  && !['X-Magasin-Session', 'X-Animateur-Session', 'X-AR-Session', 'X-Accomp-Session', 'X-Accueil-Session', 'X-Zimbra-Auth-Token', 'X-Notify-Token'].some(k => request.headers.get(k))) {
+// 27/11/2026 (sécurité) : une session n'est reconnue que si elle est VALIDE (signature, expiration, version du PIN).
+// Avant, la simple présence d'un en-tête de session (même inventé) suffisait à passer ce contrôle, et la clé partagée
+// est lisible dans les pages publiques : n'importe qui pouvait lire les routes protégées par la seule clé.
+// Le jeton Zimbra et la clé « notify » ne servent pas de session ici (la clé notify est elle aussi publique).
+const sessionValide = async () => {
+  const h = k => request.headers.get(k);
+  try {
+    if (h('X-Magasin-Session') && await verifyMagasinSession(env, h('X-Magasin-Session'))) return true;
+    if (h('X-Animateur-Session') && await verifyAnimateurSession(h('X-Animateur-Session'))) return true;
+    if (h('X-AR-Session') && await verifyArSession(h('X-AR-Session'))) return true;
+    if (h('X-Accomp-Session') && await verifyAccompSession(h('X-Accomp-Session'))) return true;
+    if (h('X-Accueil-Session') && await verifyAccueilSession(h('X-Accueil-Session'))) return true;
+  } catch (e) { /* session illisible = pas de session */ }
+  return false;
+};
+if (request.headers.get('X-Store-Token') === STORE_SECRET && env.DB && url.hostname !== 'relais.interne' && !(await sessionValide())) {
   const bloque = cleFermee && !ROUTES_SANS_SESSION.has(url.pathname);
   try {
     const ref = request.headers.get('Referer') || '', appli = (ref.match(/^https?:\/\/[^/]+\/([^/?#]+)/) || [])[1] || (ref ? new URL(ref).hostname : 'inconnue');
